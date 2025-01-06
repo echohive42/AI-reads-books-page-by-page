@@ -1,5 +1,5 @@
-pydantic
-openai
-pymupdf
-termcolor
-
+PyPDF2
+google-generativeai
+python-dotenv
+requests
+tqdm
