@@ -1,5 +1,4 @@
-pydantic
-openai
-pymupdf
-termcolor
-
+pydantic==2.10.4
+openai==1.59.3
+pymupdf==1.25.1
+termcolor==2.5.0
