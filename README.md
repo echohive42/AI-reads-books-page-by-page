@@ -1,11 +1,11 @@
 # 📚 AI reads books: Page-by-Page PDF Knowledge Extractor & Summarizer
 
-The `read_books.py` script performs an intelligent page-by-page analysis of PDF books, methodically extracting knowledge points and generating progressive summaries at specified intervals. It processes each page individually, allowing for detailed content understanding while maintaining the contextual flow of the book. Below is a detailed explanation of how the script works:
+The script performs an intelligent page-by-page analysis of PDF books, methodically extracting knowledge points and generating progressive summaries at specified intervals. It processes each page individually, allowing for detailed content understanding while maintaining the contextual flow of the book. Now with support for both OpenAI GPT and Google's Gemini Pro API!
 
 ### Features
 
 - 📚 Automated PDF book analysis and knowledge extraction
-- 🤖 AI-powered content understanding and summarization
+- 🤖 AI-powered content understanding and summarization (OpenAI GPT or Google Gemini Pro)
 - 📊 Interval-based progress summaries
 - 💾 Persistent knowledge base storage
 - 📝 Markdown-formatted summaries
@@ -14,6 +14,7 @@ The `read_books.py` script performs an intelligent page-by-page analysis of PDF 
 - ⚙️ Configurable analysis intervals and test modes
 - 🚫 Smart content filtering (skips TOC, index pages, etc.)
 - 📂 Organized directory structure for outputs
+- 🔄 Choice between OpenAI GPT and Google Gemini Pro APIs
 
 ## ❤️Join my AI Community & Get 400+ AI Projects & 1000x Cursor Course
 
@@ -40,13 +41,19 @@ This is one of 400+ fascinating projects in my collection! [Support me on Patreo
    ```
 
 2. **Configure**
+   - Create a `.env` file based on `.env.example`
+   - Add your API key (either OPENAI_API_KEY or GEMINI_API_KEY)
    - Place your PDF file in the project root directory
-   - Open `read_books.py` and update the `PDF_NAME` constant with your PDF filename
-   - (Optional) Adjust other constants like `ANALYSIS_INTERVAL` or `TEST_PAGES`
 
 3. **Run**
+   For OpenAI GPT:
    ```bash
-   python read_books.py
+   python read_books.py --pdf your_book.pdf
+   ```
+
+   For Google Gemini Pro:
+   ```bash
+   python pdf_reader_gemini.py --pdf your_book.pdf
    ```
 
 4. **Output**
@@ -58,7 +65,7 @@ This is one of 400+ fascinating projects in my collection! [Support me on Patreo
 5. **Customization Options**
    - Set `ANALYSIS_INTERVAL = None` to skip interval summaries
    - Set `TEST_PAGES = None` to process entire book
-   - Adjust `MODEL` and `ANALYSIS_MODEL` for different AI models
+   - Choose between OpenAI GPT and Gemini Pro for analysis
 
 ### Configuration Constants
 
@@ -78,7 +85,7 @@ This is one of 400+ fascinating projects in my collection! [Support me on Patreo
 
 #### `PageContent` Class
 
-A Pydantic model that represents the structure of the response from the OpenAI API for page content analysis. It has two fields:
+A Pydantic model that represents the structure of the response from the AI API for page content analysis. It has two fields:
 
 - `has_content`: A boolean indicating if the page has relevant content.
 - `knowledge`: A list of knowledge points extracted from the page.
@@ -91,17 +98,17 @@ Loads the existing knowledge base from the JSON file if it exists. If not, it re
 
 Saves the knowledge base to a JSON file. It prints a message indicating the number of items saved.
 
-#### `process_page(client: OpenAI, page_text: str, current_knowledge: list[str], page_num: int) -> list[str]`
+#### `process_page(client, page_text: str, current_knowledge: list[str], page_num: int) -> list[str]`
 
-Processes a single page of the PDF. It sends the page text to the OpenAI API for analysis and updates the knowledge base with the extracted knowledge points. It also saves the updated knowledge base to a JSON file.
+Processes a single page of the PDF. It sends the page text to the AI API for analysis and updates the knowledge base with the extracted knowledge points. It also saves the updated knowledge base to a JSON file.
 
 #### `load_existing_knowledge() -> list[str]`
 
 Loads the existing knowledge base from the JSON file if it exists. If not, it returns an empty list.
 
-#### `analyze_knowledge_base(client: OpenAI, knowledge_base: list[str]) -> str`
+#### `analyze_knowledge_base(client, knowledge_base: list[str]) -> str`
 
-Generates a comprehensive summary of the entire knowledge base using the OpenAI API. It returns the summary in markdown format.
+Generates a comprehensive summary of the entire knowledge base using the AI API. It returns the summary in markdown format.
 
 #### `setup_directories()`
 
@@ -127,10 +134,27 @@ The main function that orchestrates the entire process. It sets up directories, 
 4. **Generate Summaries**: It generates interval summaries based on the `ANALYSIS_INTERVAL` and a final summary after processing all pages.
 5. **Save Results**: It saves the knowledge base and summaries to their respective files.
 
-### Running the Script
+### API Choice Considerations
 
-1. Place your PDF in the same directory as the script.
-2. Update the `PDF_NAME` constant with your PDF filename.
-3. Run the script. It will process the book, extract knowledge points, and generate summaries.
+#### OpenAI GPT
+- More established and widely tested
+- Generally provides more consistent results
+- Higher costs but potentially better quality
+
+#### Google Gemini Pro
+- Newer alternative with competitive capabilities
+- More cost-effective option
+- Growing and improving rapidly
+- Potentially faster response times
 
 ### Example Usage
+
+Using OpenAI GPT:
+```bash
+python read_books.py --pdf "The Art of War.pdf" --interval 5
+```
+
+Using Gemini Pro:
+```bash
+python pdf_reader_gemini.py --pdf "The Art of War.pdf" --interval 5
+```
