@@ -15,17 +15,14 @@ The `read_books.py` script performs an intelligent page-by-page analysis of PDF 
 - 🚫 Smart content filtering (skips TOC, index pages, etc.)
 - 📂 Organized directory structure for outputs
 
-## ❤️Join my AI Community & Get 400+ AI Projects & 1000x Cursor Course
+## ❤️ Go deeper: Get Amplified + weekly 1000x LAB meetings
 
-This is one of 400+ fascinating projects in my collection! [Support me on Patreon](https://www.patreon.com/c/echohive42/membership) to get:
+This repo is one small doorway into the larger AI-building practice I share with patrons.
 
-- 🎯 Access to 400+ AI projects (and growing daily!)
-  - Including advanced projects like [2 Agent Real-time voice template with turn taking](https://www.patreon.com/posts/2-agent-real-you-118330397)
-- 📥 Full source code & detailed explanations
-- 📚 1000x Cursor Course
-- 🎓 Live coding sessions & AMAs
-- 💬 1-on-1 consultations (higher tiers)
-- 🎁 Exclusive discounts on AI tools & platforms (up to $180 value)
+- ❤️ [Support me on Patreon](https://www.patreon.com/c/echohive42/membership) to get the full project collection, source code, explanations, and ongoing AI-building material.
+- 🎥 [Get Amplified](https://www.patreon.com/collection/1845761) is my 55-video-post series for thinking fast, building faster, and speed-running your creativity. Learn to use Codex, Claude Code, Cursor, and other AI tools effectively and creatively. Get amplified by becoming amplifiable, with more chapters on the way in quick succession.
+- 🧠 [1000x LAB for Architect+ tiers](https://www.patreon.com/collection/759209) is the patron meeting archive: 82 focused 1000x meetings so far, with a new one added every week. These sessions go behind the scenes on real builds, agent workflows, creative tooling, and the decisions that turn experiments into finished, usable systems.
+- 🚀 Patrons get the deeper context around projects like this: source code, walkthroughs, implementation notes, and a steady stream of examples for turning AI ideas into working products.
 
 ## How to Use
 
