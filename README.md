@@ -22,6 +22,7 @@ This repo is one small doorway into the larger AI-building practice I share with
 - ❤️ [Support me on Patreon](https://www.patreon.com/c/echohive42/membership) to get the full project collection, source code, explanations, and ongoing AI-building material.
 - 🎥 [Get Amplified](https://www.patreon.com/collection/1845761) is my 55-video-post series for thinking fast, building faster, and speed-running your creativity. Learn to use Codex, Claude Code, Cursor, and other AI tools effectively and creatively. Get amplified by becoming amplifiable, with more chapters on the way in quick succession.
 - 🧠 [1000x LAB for Architect+ tiers](https://www.patreon.com/collection/759209) is the patron meeting archive: 82 focused 1000x meetings so far, with a new one added every week. These sessions go behind the scenes on real builds, agent workflows, creative tooling, and the decisions that turn experiments into finished, usable systems.
+- 🤝 Higher memberships also include 1-on-1 meetings for more direct guidance on your AI builds, workflows, and creative direction.
 - 🚀 Patrons get the deeper context around projects like this: source code, walkthroughs, implementation notes, and a steady stream of examples for turning AI ideas into working products.
 
 ## How to Use
