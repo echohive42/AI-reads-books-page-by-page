@@ -1,5 +1,4 @@
-pydantic
-openai
-pymupdf
-termcolor
-
+pydantic>=2.7,<3
+openai>=1.40,<3
+PyMuPDF>=1.24,<2
+termcolor>=2.4,<4

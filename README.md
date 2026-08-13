@@ -1,134 +1,154 @@
-# 📚 AI reads books: Page-by-Page PDF Knowledge Extractor & Summarizer
+# 📚 AI Reads Books Page by Page
 
-The `read_books.py` script performs an intelligent page-by-page analysis of PDF books, methodically extracting knowledge points and generating progressive summaries at specified intervals. It processes each page individually, allowing for detailed content understanding while maintaining the contextual flow of the book. Below is a detailed explanation of how the script works:
+A resumable PDF knowledge extractor and hierarchical summarizer built with OpenAI and PyMuPDF.
 
-### Features
+The script processes a PDF one page at a time, stores page-sourced knowledge in JSON, creates bounded interval/final summaries, and can safely resume after interruption without reprocessing completed pages.
 
-- 📚 Automated PDF book analysis and knowledge extraction
-- 🤖 AI-powered content understanding and summarization
-- 📊 Interval-based progress summaries
-- 💾 Persistent knowledge base storage
-- 📝 Markdown-formatted summaries
-- 🎨 Color-coded terminal output for better visibility
-- 🔄 Resume capability with existing knowledge base
-- ⚙️ Configurable analysis intervals and test modes
-- 🚫 Smart content filtering (skips TOC, index pages, etc.)
-- 📂 Organized directory structure for outputs
+## Highlights
 
-## ❤️ Go deeper: Get Amplified + weekly 1000x LAB meetings
+- **Resumable by default** — progress is persisted atomically after each successful page.
+- **Page-level provenance** — every knowledge point retains its source page.
+- **Bounded context** — only recent knowledge is supplied during page extraction.
+- **Bounded hierarchical summaries** — map/reduce requests limit both item count and item size.
+- **Separate models** — use one model for extraction and another for analysis.
+- **Optional OCR** — PyMuPDF/Tesseract fallback for scanned pages.
+- **Retries and usage tracking** — transient OpenAI failures are retried; token usage is accumulated when available.
+- **Safe reset** — existing output is preserved unless `--reset` is explicitly supplied.
+- **Tested without paid API calls** — the pytest suite uses fake clients and documents.
 
-This repo is one small doorway into the larger AI-building practice I share with patrons.
+## Requirements
 
-- ❤️ [Support me on Patreon](https://www.patreon.com/c/echohive42/membership) to get the full project collection, source code, explanations, and ongoing AI-building material.
-- 🎥 [Get Amplified](https://www.patreon.com/collection/1845761) is my 55-video-post series for thinking fast, building faster, and speed-running your creativity. Learn to use Codex, Claude Code, Cursor, and other AI tools effectively and creatively. Get amplified by becoming amplifiable, with more chapters on the way in quick succession.
-- 🧠 [1000x LAB for Architect+ tiers](https://www.patreon.com/collection/759209) is the patron meeting archive: 82 focused 1000x meetings so far, with a new one added every week. These sessions go behind the scenes on real builds, agent workflows, creative tooling, and the decisions that turn experiments into finished, usable systems.
-- 🤝 Higher memberships also include 1-on-1 meetings for more direct guidance on your AI builds, workflows, and creative direction.
-- 🚀 Patrons get the deeper context around projects like this: source code, walkthroughs, implementation notes, and a steady stream of examples for turning AI ideas into working products.
+- Python 3.10+
+- An OpenAI API key in `OPENAI_API_KEY`
+- Optional OCR: Tesseract plus the language packs needed by your books
 
-## How to Use
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export OPENAI_API_KEY="..."
+```
 
-1. **Setup**
-   ```bash
-   # Clone the repository
-   git clone [repository-url]
-   cd [repository-name]
+For development:
 
-   # Install requirements
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
 
-2. **Configure**
-   - Place your PDF file in the project root directory
-   - Open `read_books.py` and update the `PDF_NAME` constant with your PDF filename
-   - (Optional) Adjust other constants like `ANALYSIS_INTERVAL` or `TEST_PAGES`
+## Quick start
 
-3. **Run**
-   ```bash
-   python read_books.py
-   ```
+```bash
+python read_books.py path/to/book.pdf
+```
 
-4. **Output**
-   The script will generate:
-   - `book_analysis/knowledge_bases/`: JSON files containing extracted knowledge
-   - `book_analysis/summaries/`: Markdown files with interval and final summaries
-   - `book_analysis/pdfs/`: Copy of your PDF file
+A more complete example:
 
-5. **Customization Options**
-   - Set `ANALYSIS_INTERVAL = None` to skip interval summaries
-   - Set `TEST_PAGES = None` to process entire book
-   - Adjust `MODEL` and `ANALYSIS_MODEL` for different AI models
+```bash
+python read_books.py path/to/book.pdf \
+  --base-dir book_analysis \
+  --model gpt-4o-mini \
+  --analysis-model gpt-4o-mini \
+  --interval 20 \
+  --context-window 8 \
+  --summary-chunk-size 20 \
+  --summary-max-item-chars 8000 \
+  --ocr auto
+```
 
-### Configuration Constants
+The script is non-interactive; run `python read_books.py --help` for every option.
 
-- `PDF_NAME`: The name of the PDF file to be analyzed.
-- `BASE_DIR`: The base directory for the analysis.
-- `PDF_DIR`: Directory where the PDF file is stored.
-- `KNOWLEDGE_DIR`: Directory where the knowledge base will be saved.
-- `SUMMARIES_DIR`: Directory where the summaries will be saved.
-- `PDF_PATH`: Full path to the PDF file.
-- `OUTPUT_PATH`: Path to the knowledge base JSON file.
-- `ANALYSIS_INTERVAL`: Number of pages after which an interval analysis is generated. Set to `None` to skip interval analyses.
-- `MODEL`: The model used for processing pages.
-- `ANALYSIS_MODEL`: The model used for generating analyses.
-- `TEST_PAGES`: Number of pages to process for testing. Set to `None` to process the entire book.
+## Important CLI options
 
-### Classes and Functions
+| Option | Meaning |
+|---|---|
+| `pdf` | Source PDF path (required) |
+| `--base-dir` | Output root; default `book_analysis` |
+| `--model` | Page knowledge extraction model |
+| `--analysis-model` | Interval/final summary model |
+| `--interval N` | Create an interval summary every N pages |
+| `--test-pages N` | Process at most N pages; values above the PDF length are safe |
+| `--context-window N` | Recent knowledge items passed to the page extractor |
+| `--summary-chunk-size N` | Maximum items in each hierarchical summary request |
+| `--summary-max-item-chars N` | Maximum characters retained for each summary item |
+| `--ocr off\|auto\|always` | OCR mode; default `off` |
+| `--max-retries N` | Retries for transient OpenAI/network failures |
+| `--backoff SECONDS` | Initial exponential retry delay |
+| `--resume` | Resume the matching PDF state; default |
+| `--no-resume` | Start processing at page 1 and replace state as work succeeds |
+| `--reset` | Delete only this book's copied PDF/state/summaries and start fresh |
 
-#### `PageContent` Class
+## Output
 
-A Pydantic model that represents the structure of the response from the OpenAI API for page content analysis. It has two fields:
+For `book.pdf`, the default layout is:
 
-- `has_content`: A boolean indicating if the page has relevant content.
-- `knowledge`: A list of knowledge points extracted from the page.
+```text
+book_analysis/
+├── pdfs/book.pdf
+├── knowledge_bases/book_knowledge.json
+└── summaries/
+    ├── book_interval_00020.md
+    └── book_final.md
+```
 
-#### `load_or_create_knowledge_base() -> Dict[str, Any]`
+The JSON state includes:
 
-Loads the existing knowledge base from the JSON file if it exists. If not, it returns an empty dictionary.
+- a SHA-256 document identity, preventing accidental resume against a changed PDF;
+- `last_completed_page`;
+- `knowledge` entries shaped as `{ "page": 12, "text": "..." }`;
+- accumulated prompt/completion/total token usage when returned by the API;
+- completed interval/final summary checkpoints.
 
-#### `save_knowledge_base(knowledge_base: list[str])`
+State is written through a temporary file and atomically replaced. A failed page is never marked complete. If an interval summary fails after its page progress was saved, the missing interval is retried on the next run before later pages are processed.
 
-Saves the knowledge base to a JSON file. It prints a message indicating the number of items saved.
+## Resume and reset safety
 
-#### `process_page(client: OpenAI, page_text: str, current_knowledge: list[str], page_num: int) -> list[str]`
+Normal reruns resume automatically. If a PDF with the same filename has changed, the script stops instead of mixing old knowledge with new content:
 
-Processes a single page of the PDF. It sends the page text to the OpenAI API for analysis and updates the knowledge base with the extracted knowledge points. It also saves the updated knowledge base to a JSON file.
+```bash
+python read_books.py book.pdf --reset
+```
 
-#### `load_existing_knowledge() -> list[str]`
+`--reset` is scoped to the selected book; it does not delete other books stored under the same `--base-dir`.
 
-Loads the existing knowledge base from the JSON file if it exists. If not, it returns an empty list.
+## OCR
 
-#### `analyze_knowledge_base(client: OpenAI, knowledge_base: list[str]) -> str`
+`--ocr auto` uses extracted text when present and invokes OCR only for empty pages. `--ocr always` OCRs every page. PyMuPDF OCR requires a working Tesseract installation and language data; if unavailable, the program raises a clear dependency error instead of silently skipping scanned content.
 
-Generates a comprehensive summary of the entire knowledge base using the OpenAI API. It returns the summary in markdown format.
+Example on macOS:
 
-#### `setup_directories()`
+```bash
+brew install tesseract
+```
 
-Sets up the necessary directories for the analysis. It clears any previously generated files and ensures the PDF file is in the correct location.
+Install any additional language packs required by your PDFs according to your Tesseract distribution.
 
-#### `save_summary(summary: str, is_final: bool = False)`
+## How bounded summarization works
 
-Saves the generated summary to a markdown file. It creates a file with a proper naming convention based on whether it is a final or interval summary.
+Page extraction sees only `--context-window` recent knowledge items. Summaries use map/reduce layers: at most `--summary-chunk-size` items enter a request, and each item is truncated to `--summary-max-item-chars`. Intermediate summaries are subject to the same bound. This avoids repeatedly submitting one unbounded, ever-growing knowledge list.
 
-#### `print_instructions()`
+## Limitations
 
-Prints instructions for using the script. It explains the configuration options and how to run the script.
+- PyMuPDF text extraction may not preserve complex reading order in multi-column or heavily designed PDFs.
+- OCR quality depends on Tesseract, scan quality, and installed languages.
+- Exact-string knowledge de-duplication does not merge semantic paraphrases.
+- Character bounds control request growth but are not an exact tokenizer-based budget.
+- AI summaries can omit or distort details; retain the page-sourced JSON for verification.
 
-#### `main()`
+## Verification
 
-The main function that orchestrates the entire process. It sets up directories, loads the knowledge base, processes each page of the PDF, generates interval and final summaries, and saves them.
+```bash
+python -m pytest -q
+python -m py_compile read_books.py
+python read_books.py --help
+```
 
-### How It Works
+Tests never call the real OpenAI API or process the bundled books.
 
-1. **Setup**: The script sets up the necessary directories and ensures the PDF file is in the correct location.
-2. **Load Knowledge Base**: It loads the existing knowledge base if it exists.
-3. **Process Pages**: It processes each page of the PDF, extracting knowledge points and updating the knowledge base.
-4. **Generate Summaries**: It generates interval summaries based on the `ANALYSIS_INTERVAL` and a final summary after processing all pages.
-5. **Save Results**: It saves the knowledge base and summaries to their respective files.
+## Support the author
 
-### Running the Script
+This repository is one small doorway into the larger AI-building practice shared by the original author. You can [support the project on Patreon](https://www.patreon.com/c/echohive42/membership) and explore the author's [Get Amplified collection](https://www.patreon.com/collection/1845761).
 
-1. Place your PDF in the same directory as the script.
-2. Update the `PDF_NAME` constant with your PDF filename.
-3. Run the script. It will process the book, extract knowledge points, and generate summaries.
+## License
 
-### Example Usage
+MIT. See [LICENCE](LICENCE).
