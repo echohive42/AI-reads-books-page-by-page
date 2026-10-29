@@ -2,6 +2,7 @@ import re
 
 import pytest
 
+import backends
 import read_books
 from backends import Backend, Reply, SetupError, TransientError, UsageLimitError
 
@@ -514,7 +515,8 @@ def test_cli_defaults_keep_the_bare_command_working():
     args = read_books.build_parser().parse_args([])
 
     assert str(args.pdf) == "meditations.pdf"
-    assert (args.backend, args.model, args.summary_backend, args.summary_model) == ("api", None, None, None)
+    assert (args.backend, args.model, args.summary_backend, args.summary_model) == ("openai", None, None, None)
+    assert args.base_url is None
     assert (args.interval, args.start_page, args.test_pages, args.resume, args.reset) == (20, 1, None, True, False)
 
 
@@ -542,15 +544,37 @@ def test_summary_model_defaults_follow_the_backend():
         reader, writer = read_books.make_backends(parser.parse_args(list(argv)))
         return reader.name, reader.model, writer.name, writer.model
 
-    assert models() == ("api", read_books.API_PAGE_MODEL, "api", read_books.API_SUMMARY_MODEL)
+    assert models() == ("openai", backends.OPENAI_PAGE_MODEL, "openai", backends.OPENAI_SUMMARY_MODEL)
+    assert models("--backend", "anthropic") == ("anthropic", "claude-opus-5-5", "anthropic", "claude-opus-5-5")
+    assert models("--backend", "xai") == ("xai", "grok-4.7", "xai", "grok-4.7")
+    assert models("--backend", "openrouter") == (
+        "openrouter", backends.OPENROUTER_PAGE_MODEL, "openrouter", backends.OPENROUTER_SUMMARY_MODEL,
+    )
+    assert models("--backend", "openrouter", "--model", "x-ai/grok-4.7") == (
+        "openrouter", "x-ai/grok-4.7", "openrouter", "x-ai/grok-4.7",
+    )
+    assert models("--model", "gpt-6.1-sol", "--summary-model", "gpt-6-astra") == (
+        "openai", "gpt-6.1-sol", "openai", "gpt-6-astra",
+    )
     assert models("--backend", "grok") == ("grok", None, "grok", None)
     assert models("--backend", "codex", "--model", "m") == ("codex", "m", "codex", "m")
     assert models("--backend", "codex", "--model", "m", "--summary-backend", "claude") == (
         "codex", "m", "claude", None,
     )
-    assert models("--backend", "claude", "--summary-backend", "api") == (
-        "claude", None, "api", read_books.API_SUMMARY_MODEL,
+    assert models("--backend", "claude", "--summary-backend", "openai") == (
+        "claude", None, "openai", backends.OPENAI_SUMMARY_MODEL,
     )
+
+
+def test_base_url_goes_only_to_the_openai_backend():
+    parser = read_books.build_parser()
+    args = parser.parse_args(["--base-url", "https://example.test/v1", "--summary-backend", "anthropic"])
+    reader, writer = read_books.make_backends(args)
+
+    assert reader.base_url == "https://example.test/v1"
+    assert not hasattr(writer, "base_url")
+    with pytest.raises(SystemExit):
+        read_books.validate_args(parser, parser.parse_args(["--backend", "xai", "--base-url", "https://x.test"]))
 
 
 # --- the whole program, on a real PDF -----------------------------------------------------------

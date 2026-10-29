@@ -1,7 +1,10 @@
-"""How the reader talks to a model: the OpenAI API, or the Claude Code, Codex and Grok CLIs.
+"""How the reader talks to a model: an API key (OpenAI, Anthropic, xAI, OpenRouter),
+or the Claude Code, Codex and Grok CLIs that come with a plan.
 
 Every backend does one thing: take a system prompt and a user prompt, and return
 either JSON matching a schema (a page's notes) or Markdown (a summary).
+
+The API backends send exactly those two prompts and nothing else: no tools.
 
 The CLI backends make one locked-down, one-shot call per request. They run without a
 shell, in an empty temporary folder, with every tool switched off, so the model only
@@ -25,11 +28,24 @@ from typing import Any
 
 DEFAULT_TIMEOUT = 600  # seconds per call; a long final summary can take a few minutes
 
-# The OpenAI API's current models (checked against developers.openai.com/api/docs/models
-# on 2026-10-29): Luna is the efficient model OpenAI names as gpt-4o-mini's replacement,
-# Sol is the balanced model for the summaries.
-API_PAGE_MODEL = "gpt-6-luna"
-API_SUMMARY_MODEL = "gpt-6.1-sol"
+# Default models, checked against each provider's docs on 2026-10-29.
+# OpenAI (developers.openai.com/api/docs/models): Luna is the efficient model for
+# high-volume work, so it reads the pages; Sol is the balanced model for the summaries.
+OPENAI_PAGE_MODEL = "gpt-6-luna"
+OPENAI_SUMMARY_MODEL = "gpt-6.1-sol"
+# Anthropic (platform.claude.com/docs/en/about-claude/models/overview): Opus 5.5 is the
+# current default model. claude-haiku-5-5 reads for a fraction of the price.
+ANTHROPIC_MODEL = "claude-opus-5-5"
+# xAI (docs.x.ai/docs/models): grok-4.7 is the newest Grok 4 model, the family that
+# supports structured outputs.
+XAI_MODEL = "grok-4.7"
+# OpenRouter: the same OpenAI models, both listed with structured outputs on
+# openrouter.ai/api/v1/models?supported_parameters=structured_outputs.
+OPENROUTER_PAGE_MODEL = "openai/gpt-6-luna"
+OPENROUTER_SUMMARY_MODEL = "openai/gpt-6.1-sol"
+# Anthropic streams every call, so a long final summary never hits a request timeout;
+# this caps one answer, thinking included.
+ANTHROPIC_MAX_TOKENS = 64000
 
 # Codex features that give the model a way to run code or open files. With only
 # `-s read-only` and an empty working folder, Codex 0.163 could still read any file on
@@ -74,7 +90,8 @@ GROK_QUIET_ENV = {
 # A plan or account that is out of quota (stop and resume later), not a short rate limit (retry).
 _USAGE_LIMIT = re.compile(
     r"usage limit|hit your .{0,40}limit|(plan|session|daily|weekly|monthly) limit|out of credits"
-    r"|credit balance|insufficient_quota|quota exceeded|exceeded your current quota",
+    r"|credit balance|insufficient_quota|quota exceeded|exceeded your current quota"
+    r"|insufficient credits|spending limit",
     re.IGNORECASE,
 )
 _NOT_LOGGED_IN = re.compile(
@@ -125,6 +142,14 @@ def _usage(prompt: Any = None, completion: Any = None, total: Any = None) -> dic
     return usage
 
 
+# Providers echo part of a rejected key in their error text ("sk-proj-****jCcA"); never print it.
+_KEY_LIKE = re.compile(r"\b(?:sk|xai|key)-[A-Za-z0-9_*.\-]{6,}")
+
+
+def _redact(error: Exception | str) -> str:
+    return _KEY_LIKE.sub("[key hidden]", str(error))
+
+
 def _tail(text: str, limit: int = 600) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else "…" + text[-limit:]
@@ -132,6 +157,8 @@ def _tail(text: str, limit: int = 600) -> str:
 
 class Backend:
     name = "backend"
+    page_model: str | None = None  # None: the CLI's own default
+    summary_model: str | None = None
 
     def __init__(self, model: str | None = None, effort: str | None = None, timeout: float = DEFAULT_TIMEOUT):
         self.model = model
@@ -148,33 +175,40 @@ class Backend:
         raise NotImplementedError
 
 
-class OpenAIBackend(Backend):
-    """The original way: the OpenAI API with OPENAI_API_KEY."""
+_PLAN_HINT = "or read with a plan you already have: --backend claude, --backend codex or --backend grok."
 
-    name = "api"
+
+class OpenAICompatibleBackend(Backend):
+    """Chat Completions through the openai SDK. OpenAI, xAI and OpenRouter all speak it."""
+
+    provider = ""
+    key_env = ""
+    base_url: str | None = None
+    extra_headers: dict[str, str] = {}
 
     def __init__(self, model: str | None = None, effort: str | None = None, timeout: float = DEFAULT_TIMEOUT,
-                 client: Any = None):
-        super().__init__(model or API_PAGE_MODEL, effort, timeout)
+                 client: Any = None, base_url: str | None = None):
+        super().__init__(model or self.page_model, effort, timeout)
         self.client = client
+        if base_url:
+            self.base_url = base_url
 
     def check(self) -> None:
-        if self.client is None and not os.environ.get("OPENAI_API_KEY"):
-            raise SetupError(
-                "OPENAI_API_KEY is not set. Export your key, or read with a plan you already have: "
-                "--backend claude, --backend codex or --backend grok."
-            )
+        if self.client is None and not os.environ.get(self.key_env):
+            raise SetupError(f"{self.key_env} is not set. Export your {self.provider} API key, {_PLAN_HINT}")
 
     def _client(self) -> Any:
         if self.client is None:
             from openai import OpenAI
 
-            self.client = OpenAI(timeout=self.timeout, max_retries=0)  # the reader does its own retries
+            self.client = OpenAI(
+                api_key=os.environ.get(self.key_env), base_url=self.base_url, timeout=self.timeout,
+                max_retries=0,  # the reader does its own retries
+                default_headers=self.extra_headers or None,
+            )
         return self.client
 
-    def ask(self, system: str, prompt: str, schema: dict[str, Any] | None = None) -> Reply:
-        import openai
-
+    def request(self, system: str, prompt: str, schema: dict[str, Any] | None) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
@@ -186,26 +220,217 @@ class OpenAIBackend(Backend):
                 "type": "json_schema",
                 "json_schema": {"name": "page_notes", "strict": True, "schema": schema},
             }
+        return request
+
+    def model_hint(self) -> str:
+        return f"{self.provider} does not know the model {self.model!r}. Pick another with --model."
+
+    def api_error(self, exc: Exception) -> BackendError:
+        import openai
+
+        status, text = getattr(exc, "status_code", None), _redact(exc)
+        if isinstance(exc, openai.AuthenticationError):
+            return SetupError(f"{self.provider} rejected the key in {self.key_env}: {text}")
+        if status == 402 or (status in (400, 403, 429) and _USAGE_LIMIT.search(text)):
+            return UsageLimitError(f"The {self.provider} account is out of credits or quota: {text}")
+        if isinstance(exc, openai.NotFoundError):
+            return SetupError(f"{self.model_hint()} ({text})")
+        if isinstance(exc, (openai.APIConnectionError, openai.RateLimitError, openai.InternalServerError)) \
+                or status in (408, 409):
+            return TransientError(f"{self.provider} API: {text}")
+        return BackendError(f"{self.provider} API: {text}")
+
+    def ask(self, system: str, prompt: str, schema: dict[str, Any] | None = None) -> Reply:
+        import openai
+
         started = time.monotonic()
         try:
-            response = self._client().chat.completions.create(**request)
-        except openai.AuthenticationError as exc:
-            raise SetupError(f"The OpenAI API rejected the key: {exc}") from exc
-        except openai.RateLimitError as exc:
-            if _USAGE_LIMIT.search(str(exc)):
-                raise UsageLimitError(f"The OpenAI account is out of quota: {exc}") from exc
-            raise TransientError(f"OpenAI rate limit: {exc}") from exc
-        except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError) as exc:
-            raise TransientError(f"OpenAI API: {exc}") from exc
-        except openai.NotFoundError as exc:
-            raise SetupError(f"OpenAI does not know the model {self.model!r}: {exc}") from exc
+            response = self._client().chat.completions.create(**self.request(system, prompt, schema))
+        except openai.APIError as exc:
+            raise self.api_error(exc) from exc
         seconds = time.monotonic() - started
-        message = response.choices[0].message
+        # OpenRouter can answer 200 with an error in the body instead of choices.
+        error = (getattr(response, "model_extra", None) or {}).get("error")
+        if not getattr(response, "choices", None):
+            message = error.get("message") if isinstance(error, dict) else error
+            raise TransientError(f"{self.provider} sent no answer: {message or 'empty response'}")
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "error":
+            raise TransientError(f"{self.provider}: the model stopped with an error partway through")
+        message = choice.message
         if getattr(message, "refusal", None):
             raise TransientError(f"The model refused: {message.refusal}")
         text = message.content or ""
         usage = getattr(response, "usage", None)
         tokens = _usage(*(getattr(usage, name, None) for name in ("prompt_tokens", "completion_tokens", "total_tokens")))
+        return Reply(_parse_json(text) if schema else text.strip(), tokens, seconds)
+
+
+class OpenAIBackend(OpenAICompatibleBackend):
+    """The original way: the OpenAI API with OPENAI_API_KEY.
+
+    Docs: https://developers.openai.com/api/docs/guides/structured-outputs
+    """
+
+    name = "openai"
+    provider = "OpenAI"
+    key_env = "OPENAI_API_KEY"
+    page_model = OPENAI_PAGE_MODEL
+    summary_model = OPENAI_SUMMARY_MODEL
+
+
+class XAIBackend(OpenAICompatibleBackend):
+    """The xAI API with XAI_API_KEY, through its OpenAI-compatible endpoint.
+
+    Docs: https://docs.x.ai/docs/guides/structured-outputs (response_format json_schema,
+    Grok 4 models) and https://docs.x.ai/docs/guides/reasoning (reasoning_effort).
+    """
+
+    name = "xai"
+    provider = "xAI"
+    key_env = "XAI_API_KEY"
+    base_url = "https://api.x.ai/v1"
+    page_model = XAI_MODEL
+    summary_model = XAI_MODEL
+
+
+class OpenRouterBackend(OpenAICompatibleBackend):
+    """OpenRouter with OPENROUTER_API_KEY: one key for models from many providers.
+
+    Not every model or provider supports a JSON schema, and by default OpenRouter may
+    quietly drop it, so page calls set provider.require_parameters: only providers that
+    honour the schema get them.
+    Docs: https://openrouter.ai/docs/features/structured-outputs
+    and https://openrouter.ai/docs/features/provider-routing
+    """
+
+    name = "openrouter"
+    provider = "OpenRouter"
+    key_env = "OPENROUTER_API_KEY"
+    base_url = "https://openrouter.ai/api/v1"
+    page_model = OPENROUTER_PAGE_MODEL
+    summary_model = OPENROUTER_SUMMARY_MODEL
+    # Optional headers that name the app on openrouter.ai (docs: api-reference/overview).
+    extra_headers = {
+        "HTTP-Referer": "https://github.com/echohive42/AI-reads-books-page-by-page",
+        "X-OpenRouter-Title": "AI reads books page by page",
+    }
+
+    def request(self, system: str, prompt: str, schema: dict[str, Any] | None) -> dict[str, Any]:
+        request = super().request(system, prompt, schema)
+        extra: dict[str, Any] = {}
+        # OpenRouter's documented form is a reasoning object (docs: use-cases/reasoning-tokens).
+        if request.pop("reasoning_effort", None):
+            extra["reasoning"] = {"effort": self.effort}
+        if schema:
+            extra["provider"] = {"require_parameters": True}
+        if extra:
+            request["extra_body"] = extra
+        return request
+
+    def model_hint(self) -> str:
+        return (
+            f"OpenRouter could not serve {self.model!r}. Check the model ID; for reading pages it also has to "
+            "support structured outputs: https://openrouter.ai/models?supported_parameters=structured_outputs"
+        )
+
+    def api_error(self, exc: Exception) -> BackendError:
+        # 503: "no available model provider that meets your routing requirements" (docs: api-reference/errors).
+        if getattr(exc, "status_code", None) == 503 and re.search(r"routing|provider", str(exc), re.IGNORECASE):
+            return SetupError(f"{self.model_hint()} ({_redact(exc)})")
+        return super().api_error(exc)
+
+
+class AnthropicBackend(Backend):
+    """The Anthropic API (Claude) with ANTHROPIC_API_KEY, through Anthropic's own SDK.
+
+    The native SDK is used on purpose: Anthropic's OpenAI-compatible endpoint ignores
+    response_format (https://platform.claude.com/docs/en/api/openai-sdk).
+    Docs: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    (output_config.format), https://platform.claude.com/docs/en/build-with-claude/streaming
+    and https://platform.claude.com/docs/en/api/errors
+    """
+
+    name = "anthropic"
+    page_model = ANTHROPIC_MODEL
+    summary_model = ANTHROPIC_MODEL
+
+    def __init__(self, model: str | None = None, effort: str | None = None, timeout: float = DEFAULT_TIMEOUT,
+                 client: Any = None):
+        super().__init__(model or self.page_model, effort, timeout)
+        self.client = client
+
+    def check(self) -> None:
+        # The SDK also accepts ANTHROPIC_AUTH_TOKEN or a profile from `ant auth login`.
+        if self.client is None and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                                        or shutil.which("ant")):
+            raise SetupError(f"ANTHROPIC_API_KEY is not set. Export your Anthropic API key, {_PLAN_HINT}")
+
+    def _client(self) -> Any:
+        if self.client is None:
+            import anthropic
+
+            self.client = anthropic.Anthropic(timeout=self.timeout, max_retries=0)  # the reader does its own retries
+        return self.client
+
+    def request(self, system: str, prompt: str, schema: dict[str, Any] | None) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        output_config: dict[str, Any] = {}
+        if self.effort:
+            output_config["effort"] = self.effort
+        if schema:
+            output_config["format"] = {"type": "json_schema", "schema": schema}
+        if output_config:
+            request["output_config"] = output_config
+        return request
+
+    def api_error(self, exc: Exception) -> BackendError:
+        import anthropic
+
+        status, text = getattr(exc, "status_code", None), _redact(exc)
+        if status == 402 or (status in (400, 403, 429) and _USAGE_LIMIT.search(text)):
+            return UsageLimitError(f"The Anthropic account is out of credits: {text}")
+        if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+            return SetupError(f"Anthropic rejected the key: {text}")
+        if isinstance(exc, anthropic.NotFoundError):
+            return SetupError(f"Anthropic does not know the model {self.model!r}. Pick another with --model. ({text})")
+        if isinstance(exc, (anthropic.APIConnectionError, anthropic.RateLimitError)) \
+                or (isinstance(status, int) and (status >= 500 or status in (408, 409))):
+            return TransientError(f"Anthropic API: {text}")  # 529 overloaded is a 5xx too
+        return BackendError(f"Anthropic API: {text}")
+
+    def ask(self, system: str, prompt: str, schema: dict[str, Any] | None = None) -> Reply:
+        import anthropic
+
+        started = time.monotonic()
+        try:
+            # Streamed and collected: the SDK's advice for long inputs and outputs.
+            with self._client().messages.stream(**self.request(system, prompt, schema)) as stream:
+                message = stream.get_final_message()
+        except anthropic.APIError as exc:
+            raise self.api_error(exc) from exc
+        except (anthropic.CredentialsError, TypeError) as exc:
+            if isinstance(exc, TypeError) and "authentication" not in str(exc):
+                raise
+            raise SetupError(f"No Anthropic credentials found: export ANTHROPIC_API_KEY. ({_redact(exc)})") from exc
+        seconds = time.monotonic() - started
+        if message.stop_reason == "refusal":
+            details = getattr(message, "stop_details", None)
+            raise TransientError(f"Claude declined this request: {getattr(details, 'explanation', None) or 'refusal'}")
+        if message.stop_reason == "max_tokens":
+            raise TransientError(f"Claude's answer was cut off at {ANTHROPIC_MAX_TOKENS} tokens")
+        text = "".join(block.text for block in message.content if getattr(block, "type", None) == "text")
+        usage = message.usage
+        prompt_tokens = sum(
+            getattr(usage, name, None) or 0
+            for name in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+        )
+        tokens = _usage(prompt_tokens, getattr(usage, "output_tokens", None))
         return Reply(_parse_json(text) if schema else text.strip(), tokens, seconds)
 
 
@@ -495,8 +720,12 @@ class GrokBackend(CLIBackend):
         return text, tokens
 
 
+# API keys first, then the CLIs that come with a plan.
 BACKENDS: dict[str, type[Backend]] = {
-    "api": OpenAIBackend,
+    "openai": OpenAIBackend,
+    "anthropic": AnthropicBackend,
+    "xai": XAIBackend,
+    "openrouter": OpenRouterBackend,
     "claude": ClaudeBackend,
     "codex": CodexBackend,
     "grok": GrokBackend,
@@ -504,9 +733,11 @@ BACKENDS: dict[str, type[Backend]] = {
 
 
 def make_backend(name: str, model: str | None = None, effort: str | None = None,
-                 timeout: float = DEFAULT_TIMEOUT) -> Backend:
+                 timeout: float = DEFAULT_TIMEOUT, base_url: str | None = None) -> Backend:
     try:
         backend_class = BACKENDS[name]
     except KeyError:
         raise SetupError(f"Unknown backend {name!r}; choose one of {', '.join(BACKENDS)}") from None
+    if base_url and backend_class is OpenAIBackend:
+        return OpenAIBackend(model=model, effort=effort, timeout=timeout, base_url=base_url)
     return backend_class(model=model, effort=effort, timeout=timeout)

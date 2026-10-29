@@ -4,18 +4,19 @@ Give it a PDF, and an AI reads it the way you would study a book: one page at a 
 
 On every page it writes down what it learned, each note tagged with its page number. Every 20 pages it stops and writes down **what it understands so far**. When it reaches the last page, it pulls the whole book together into one final summary. You watch it happen live in your terminal, page by page.
 
-## ✨ Run it on the ChatGPT, Claude or Grok plan you already have, no API key needed
+## ✨ Pick who reads: a plan you already have, or an API key
 
-The reader can now use the coding CLI that comes with your plan instead of a paid API key:
-
-| You have | Run with | Sign in once with |
+| You have | Run with | Set up once |
 |---|---|---|
-| A ChatGPT plan | `--backend codex` (the [Codex CLI](https://developers.openai.com/codex)) | `codex login` |
+| A ChatGPT plan | `--backend codex` ([Codex CLI](https://developers.openai.com/codex)) | `codex login` |
 | A Claude plan | `--backend claude` ([Claude Code](https://code.claude.com/docs)) | run `claude` and sign in |
 | A Grok plan | `--backend grok` ([Grok Build](https://docs.x.ai/build/overview)) | `grok login` |
-| An OpenAI API key | `--backend api` (the default) | `export OPENAI_API_KEY=...` |
+| An OpenAI API key | `--backend openai` (the default) | `export OPENAI_API_KEY=...` |
+| An Anthropic API key | `--backend anthropic` | `export ANTHROPIC_API_KEY=...` |
+| An xAI API key | `--backend xai` | `export XAI_API_KEY=...` |
+| An OpenRouter key | `--backend openrouter` | `export OPENROUTER_API_KEY=...` |
 
-Whichever you pick, it still reads one page per call. The CLI only ever sees the page in front of it and the reader's own notes. It never gets the PDF file, a shell, or any tools (see [What the AI can see](#-what-the-ai-can-see)).
+A plan needs no API key: the reader uses the coding CLI that comes with it. Whichever you pick, it still reads one page per call, and the model only ever sees the page in front of it plus the reader's own notes. It never gets the PDF file, a shell, or any tools (see [What the AI can see](#-what-the-ai-can-see)).
 
 ## 🚀 Quick start
 
@@ -27,34 +28,16 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Then pick the way you want it to read. Each example reads 3 pages of the bundled `meditations.pdf`, starting at page 31 where Book One begins. That is a quick taste before you give it a whole book.
-
-**On your ChatGPT plan (Codex):**
+Then try 3 pages of the bundled `meditations.pdf`, starting at page 31 where Book One begins. Use the line for whatever you have:
 
 ```bash
-codex login
-python read_books.py --backend codex --start-page 31 --test-pages 3
-```
-
-**On your Claude plan (Claude Code):**
-
-```bash
-claude   # sign in once, then exit
-python read_books.py --backend claude --start-page 31 --test-pages 3
-```
-
-**On your Grok plan (Grok Build):**
-
-```bash
-grok login
-python read_books.py --backend grok --start-page 31 --test-pages 3
-```
-
-**With an OpenAI API key:**
-
-```bash
-export OPENAI_API_KEY="sk-..."
-python read_books.py --start-page 31 --test-pages 3
+python read_books.py --backend codex --start-page 31 --test-pages 3      # ChatGPT plan
+python read_books.py --backend claude --start-page 31 --test-pages 3     # Claude plan
+python read_books.py --backend grok --start-page 31 --test-pages 3       # Grok plan
+python read_books.py --start-page 31 --test-pages 3                      # OpenAI API key
+python read_books.py --backend anthropic --start-page 31 --test-pages 3  # Anthropic API key
+python read_books.py --backend xai --start-page 31 --test-pages 3        # xAI API key
+python read_books.py --backend openrouter --start-page 31 --test-pages 3 # OpenRouter key
 ```
 
 When you are ready for a whole book:
@@ -64,6 +47,15 @@ python read_books.py path/to/your_book.pdf --backend codex
 ```
 
 Stop it any time with Ctrl+C. Every finished page is saved, and running the same command again carries on from where it stopped.
+
+## ✅ What has been tested
+
+Being straight with you about what was run for real:
+
+- **Run on real pages** (3 pages of `meditations.pdf`, with a look back and a final summary): the **Codex** and **Grok Build** CLIs.
+- **Checked against each provider's official docs, but not yet run live**: the **OpenAI**, **Anthropic**, **xAI** and **OpenRouter** APIs, and the **Claude Code** CLI. Each one has offline tests that run the real SDK and check the exact request the provider would receive and how its answers and errors are handled. The doc pages each backend follows are linked in [`backends.py`](backends.py).
+
+If you run one of the untested ones, an issue saying how it went would help everyone.
 
 ## 🧠 How it works
 
@@ -104,14 +96,15 @@ And when it stops to look back (that test run used `--interval 2`; the default i
 ✨ What I understand so far, saved to: book_analysis/summaries/meditations_interval_00032.md
 ```
 
-## ❤️ Go deeper: Get Amplified + weekly 1000x LAB meetings
+## ❤️ More from me
 
-This repo is one small doorway into the larger AI-building practice I share with patrons.
+This repo is one small piece of what I build and share at **[echohive.ai](https://www.echohive.ai/)**: build better with AI, see markets more clearly, and strengthen the mind behind both.
 
-- ❤️ [Support me on Patreon](https://www.patreon.com/c/echohive42/membership) to get the full project collection, source code, explanations, and ongoing AI-building material.
-- 🎥 [Get Amplified](https://www.patreon.com/collection/1845761) is my series for thinking fast, building faster, and speed-running your creativity: 90+ lessons, and some are free to watch. Learn to use Codex, Claude Code, Cursor, and other AI tools effectively and creatively. Get amplified by becoming amplifiable.
-- 🧠 [1000x LAB for Architect+ tiers](https://www.patreon.com/collection/759209) meets live every Sunday at 12 PM Pacific, and every past meeting stays in the archive. These sessions go behind the scenes on real builds, agent workflows, creative tooling, and the decisions that turn experiments into finished, usable systems.
-- 🤝 Higher memberships also include 1-on-1 meetings for more direct guidance on your AI builds, workflows, and creative direction.
+- 🎥 **[Get Amplified](https://www.echohive.ai/get-amplified)**: a living field guide for AI, markets, and mind. 90+ self-paced video lessons, and some are free to watch. Also on [Patreon](https://www.patreon.com/collection/1845761).
+- 🧠 **[1000x Lab](https://www.patreon.com/collection/759209)**: live every Sunday at 12 PM Pacific. Join it live, then rewatch any past session in the archive. It comes with the Architect membership.
+- ❤️ **[Membership](https://www.echohive.ai/membership)**: start free and upgrade when you are ready. Join on [Patreon](https://www.patreon.com/echohive42/membership).
+- 🤝 **[Consulting](https://www.echohive.ai/consulting)**: private, one-to-one strategic sessions on AI strategy, agentic systems, research and market intelligence. Bring an ambitious project or a consequential decision.
+- 📺 [YouTube](https://www.youtube.com/channel/UCL7przoMtZTmiQMhc9ifIww) and 𝕏 [@hive_echo](https://x.com/hive_echo) for new videos and experiments.
 
 ## 📂 What you get
 
@@ -136,10 +129,10 @@ Run `python read_books.py --help` for all of them. The ones you will use most:
 | Option | What it does |
 |---|---|
 | `pdf` | The book to read (default: `meditations.pdf`) |
-| `--backend api\|claude\|codex\|grok` | Who reads it (default: `api`) |
-| `--model NAME` | The model for reading pages (default: `gpt-6-luna` on the API, the CLI's own default otherwise) |
-| `--summary-backend`, `--summary-model` | Let a different backend or model write the summaries (default on the API: `gpt-6.1-sol`) |
-| `--effort low\|medium\|high` | Reasoning effort, for models that have it |
+| `--backend NAME` | Who reads it: `openai` (default), `anthropic`, `xai`, `openrouter`, `claude`, `codex` or `grok` |
+| `--model NAME` | The model for pages and summaries (defaults below) |
+| `--summary-backend`, `--summary-model` | Let a different backend or model write the summaries |
+| `--effort LEVEL` | Reasoning effort, for models that have it (for example `low`, `medium`, `high`) |
 | `--start-page N` | Start at page N, for example to skip the front matter |
 | `--test-pages N` | Read only N pages, to try things out |
 | `--interval N` | Look back every N pages (default: 20; 0 turns it off) |
@@ -147,8 +140,21 @@ Run `python read_books.py --help` for all of them. The ones you will use most:
 | `--ocr auto` | Read scanned pages with Tesseract (`brew install tesseract` on a Mac) |
 | `--reset` | Forget this book's notes and summaries and start over |
 | `--timeout SECONDS` | How long one model call may take (default: 600) |
+| `--base-url URL` | Send `--backend openai` requests to another OpenAI-compatible endpoint |
 
-For example, read with Grok but let Claude write the summaries:
+The default models:
+
+| Backend | Reads pages with | Writes summaries with |
+|---|---|---|
+| `openai` | `gpt-6-luna` | `gpt-6.1-sol` |
+| `anthropic` | `claude-opus-5-5` | `claude-opus-5-5` |
+| `xai` | `grok-4.7` | `grok-4.7` |
+| `openrouter` | `openai/gpt-6-luna` | `openai/gpt-6.1-sol` |
+| `claude`, `codex`, `grok` | the CLI's own default | the same |
+
+`--model` sets both; add `--summary-model` to give the summaries their own. On Anthropic, `--model claude-haiku-5-5` reads for a fraction of the price of Opus. On OpenRouter, pick a model that can return structured outputs ([this list](https://openrouter.ai/models?supported_parameters=structured_outputs)); the reader only sends pages to providers that honour the format, and tells you if your model has none.
+
+You can mix backends. For example, read with Grok but let Claude write the summaries:
 
 ```bash
 python read_books.py your_book.pdf --backend grok --summary-backend claude
@@ -156,7 +162,11 @@ python read_books.py your_book.pdf --backend grok --summary-backend claude
 
 ## 🔒 What the AI can see
 
-Only the text the reader sends it. Each CLI call is a one-shot run with no shell, in an empty temporary folder, and with its tools switched off. The page text goes in through standard input (or a temporary prompt file for Grok), never on the command line. No call ever uses an always-approve or skip-permissions flag.
+Only the text the reader sends it: one page, the end of the page before it, and its own notes.
+
+The API backends send that text with a fixed system prompt and nothing else: no tools, no files.
+
+Each CLI call is a one-shot run with no shell, in an empty temporary folder, and with its tools switched off. The page text goes in through standard input (or a temporary prompt file for Grok), never on the command line. No call ever uses an always-approve or skip-permissions flag.
 
 - **Claude Code:** `claude -p --tools "" --safe-mode --strict-mcp-config --no-session-persistence --json-schema ...`
 - **Codex:** `codex exec -s read-only --ephemeral --ignore-user-config` with its shell, exec, image and plugin features turned off and web search disabled, plus `--output-schema`.
@@ -168,20 +178,21 @@ Codex and Claude runs are not saved anywhere. Grok Build has no such option yet,
 
 ## ⚖️ Honest trade-offs
 
-- **A CLI is slower than the API.** Every page starts a fresh CLI run, and that startup time comes on top of the model's own thinking. In our 3 page test with each CLI's default model, a page took about 13 seconds on Codex and about 19 seconds on Grok. So a 250 page book is roughly an hour or more of reading, plus the summaries. You can leave it running, and Ctrl+C never loses a finished page.
-- **Plan limits can stop a long book.** When your plan hits its usage limit, the reader stops, keeps every page so far, and tells you. Run the same command later and it carries on.
-- **Your book's text goes to the provider you choose** (OpenAI, Anthropic or xAI), under your account's terms. Only send books you are happy to share with them.
+- **A CLI is slower than an API.** Every page starts a fresh CLI run, and that startup time comes on top of the model's own thinking. In our 3 page test with each CLI's default model, a page took about 13 seconds on Codex and about 19 seconds on Grok. So a 250 page book is roughly an hour or more of reading, plus the summaries. You can leave it running, and Ctrl+C never loses a finished page.
+- **An API key is billed per use.** A book is one call per page plus a few summaries, so a 250 page book is a few hundred calls. Try `--test-pages 3` first to see what a page costs you.
+- **Limits can stop a long book.** When your plan hits its usage limit or your API account runs out of credit, the reader stops, keeps every page so far, and tells you. Run the same command later and it carries on.
+- **Your book's text goes to the provider you choose** (OpenAI, Anthropic, xAI, or OpenRouter and the provider it routes to), under your account's terms. Only send books you are happy to share with them.
 - **Summaries are AI writing.** They can miss or bend things. Every note keeps its page number, so you can check it against the book.
 - **PDF text is not always clean.** Multi-column or heavily designed pages can come out in the wrong order, and scanned pages need `--ocr auto`.
 
-## 🧪 Tests
+## 🧪 Running the tests
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The tests use fake backends and a stand-in CLI, so they never call a real model or use any of your plan.
+The tests use fake backends, a stand-in CLI, and the real OpenAI and Anthropic SDKs talking to a fake server, so they never call a real model or use any of your plan or credit.
 
 ## 🙏 Thanks
 

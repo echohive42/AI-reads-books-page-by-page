@@ -29,8 +29,6 @@ from pydantic import BaseModel, ValidationError
 from termcolor import colored
 
 from backends import (
-    API_PAGE_MODEL,
-    API_SUMMARY_MODEL,
     BACKENDS,
     DEFAULT_TIMEOUT,
     Backend,
@@ -800,6 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python read_books.py mybook.pdf --backend claude      # on your Claude plan\n"
             "  python read_books.py mybook.pdf --backend codex       # on your ChatGPT plan\n"
             "  python read_books.py mybook.pdf --backend grok        # on your Grok plan\n"
+            "  python read_books.py mybook.pdf --backend anthropic   # with ANTHROPIC_API_KEY (also: xai, openrouter)\n"
             "  python read_books.py --start-page 31 --test-pages 3   # a quick 3-page taste"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -807,15 +806,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("pdf", type=Path, nargs="?", default=DEFAULT_PDF,
                         help=f"PDF file to read (default: {DEFAULT_PDF})")
     reading = parser.add_argument_group("who reads")
-    reading.add_argument("--backend", choices=tuple(BACKENDS), default="api",
-                         help="api = OpenAI API key; claude, codex, grok = the CLI and plan you already have "
-                              "(default: api)")
+    reading.add_argument("--backend", choices=tuple(BACKENDS), default="openai",
+                         help="openai, anthropic, xai, openrouter = an API key; claude, codex, grok = the CLI "
+                              "and plan you already have (default: openai)")
     reading.add_argument("--model", default=None,
-                         help=f"page reading model (default: {API_PAGE_MODEL} on api, the CLI's own default otherwise)")
+                         help="the model for pages and summaries (default: each backend's own; on openai "
+                              f"{BACKENDS['openai'].page_model} reads and {BACKENDS['openai'].summary_model} summarises)")
     reading.add_argument("--summary-backend", choices=tuple(BACKENDS), default=None,
                          help="who writes the summaries (default: same as --backend)")
     reading.add_argument("--summary-model", "--analysis-model", dest="summary_model", default=None,
-                         help=f"summary model (default: {API_SUMMARY_MODEL} on api, else the --model or CLI default)")
+                         help="a different model for the summaries")
+    reading.add_argument("--base-url", default=None,
+                         help="send the openai backend's requests to another OpenAI-compatible endpoint")
     reading.add_argument("--effort", default=None,
                          help="reasoning effort passed to the model, e.g. low, medium, high (default: the model's own)")
     reading.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds allowed per model call")
@@ -861,17 +863,18 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--max-retries must be >= 0")
     if args.timeout <= 0:
         parser.error("--timeout must be > 0")
+    if args.base_url and "openai" not in (args.backend, args.summary_backend):
+        parser.error("--base-url only works with --backend openai (or --summary-backend openai)")
 
 
 def make_backends(args: argparse.Namespace) -> tuple[Backend, Backend]:
-    reader = make_backend(args.backend, args.model, args.effort, args.timeout)
+    reader = make_backend(args.backend, args.model, args.effort, args.timeout, args.base_url)
     summary_name = args.summary_backend or args.backend
     summary_model = args.summary_model
     if summary_model is None:
-        summary_model = API_SUMMARY_MODEL if summary_name == "api" else (
-            args.model if summary_name == args.backend else None
-        )
-    summarizer = make_backend(summary_name, summary_model, args.effort, args.timeout)
+        # --model covers the summaries too when the same backend writes them.
+        summary_model = args.model if (summary_name == args.backend and args.model) else BACKENDS[summary_name].summary_model
+    summarizer = make_backend(summary_name, summary_model, args.effort, args.timeout, args.base_url)
     return reader, summarizer
 
 

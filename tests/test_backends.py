@@ -9,10 +9,14 @@ import pytest
 
 import backends
 from backends import (
+    AnthropicBackend,
+    BackendError,
     ClaudeBackend,
     CodexBackend,
     GrokBackend,
     OpenAIBackend,
+    OpenRouterBackend,
+    XAIBackend,
     SetupError,
     TransientError,
     UsageLimitError,
@@ -323,7 +327,7 @@ def test_a_cli_that_hangs_is_stopped_with_everything_it_started(fake_cli, monkey
         pytest.fail("the CLI's child process was left running")
 
 
-# --- the OpenAI API ---------------------------------------------------------------------------------
+# --- the API backends: OpenAI, xAI, OpenRouter (openai SDK) and Anthropic (its own SDK) -----------
 
 
 class _Obj:
@@ -332,16 +336,29 @@ class _Obj:
 
 
 class FakeOpenAI:
-    def __init__(self, content="", error=None):
-        self.content, self.error, self.requests = content, error, []
+    def __init__(self, content="", error=None, response=None):
+        self.content, self.error, self.response, self.requests = content, error, response, []
         self.chat = _Obj(completions=_Obj(create=self.create))
 
     def create(self, **request):
         self.requests.append(request)
         if self.error:
             raise self.error
+        if self.response is not None:
+            return self.response
         usage = _Obj(prompt_tokens=11, completion_tokens=4, total_tokens=15)
-        return _Obj(choices=[_Obj(message=_Obj(content=self.content, refusal=None))], usage=usage)
+        choice = _Obj(message=_Obj(content=self.content, refusal=None), finish_reason="stop")
+        return _Obj(choices=[choice], usage=usage)
+
+
+def openai_error(kind, message, code):
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.example.test/v1/chat/completions")
+    if kind == "connection":
+        return openai.APIConnectionError(request=request)
+    return getattr(openai, kind)(message, response=httpx.Response(code, request=request), body=None)
 
 
 def test_openai_page_calls_use_a_strict_schema_and_the_current_default_model():
@@ -349,10 +366,11 @@ def test_openai_page_calls_use_a_strict_schema_and_the_current_default_model():
     reply = OpenAIBackend(effort="low", client=client).ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
 
     request = client.requests[0]
-    assert request["model"] == backends.API_PAGE_MODEL
+    assert request["model"] == backends.OPENAI_PAGE_MODEL
     assert request["response_format"]["json_schema"] == {"name": "page_notes", "strict": True, "schema": PAGE_SCHEMA}
     assert request["reasoning_effort"] == "low"
     assert request["messages"] == [{"role": "system", "content": "SYSTEM"}, {"role": "user", "content": PAGE_TEXT}]
+    assert "tools" not in request and "extra_body" not in request
     assert reply.value == {"has_content": True}
     assert reply.usage == {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
 
@@ -365,30 +383,362 @@ def test_openai_summary_calls_return_markdown():
     assert "response_format" not in client.requests[0] and "reasoning_effort" not in client.requests[0]
 
 
-def test_openai_errors_are_classified():
+def test_each_openai_compatible_provider_has_its_own_endpoint_key_and_default_model(monkeypatch):
+    for name in ("OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_BASE_URL"):
+        monkeypatch.setenv(name, f"test-{name}") if name != "OPENAI_BASE_URL" else monkeypatch.delenv(name, raising=False)
+
+    openai_client = OpenAIBackend()._client()
+    xai_client = XAIBackend()._client()
+    router_client = OpenRouterBackend()._client()
+    custom_client = OpenAIBackend(base_url="https://compatible.example.test/v1")._client()
+
+    assert str(openai_client.base_url).startswith("https://api.openai.com/v1")
+    assert str(xai_client.base_url).startswith("https://api.x.ai/v1")
+    assert str(router_client.base_url).startswith("https://openrouter.ai/api/v1")
+    assert str(custom_client.base_url).startswith("https://compatible.example.test/v1")
+    assert openai_client.api_key == "test-OPENAI_API_KEY" and xai_client.api_key == "test-XAI_API_KEY"
+    assert router_client.api_key == "test-OPENROUTER_API_KEY"
+    assert router_client.max_retries == 0 and xai_client.max_retries == 0  # the reader retries, with backoff
+    assert router_client.default_headers["X-OpenRouter-Title"] == "AI reads books page by page"
+    assert (XAIBackend().model, OpenRouterBackend().model) == (backends.XAI_MODEL, backends.OPENROUTER_PAGE_MODEL)
+
+
+def test_xai_uses_the_openai_shape_with_reasoning_effort():
+    client = FakeOpenAI(content='{"has_content": false}')
+    XAIBackend(effort="high", client=client).ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+
+    request = client.requests[0]
+    assert request["model"] == "grok-4.7" and request["reasoning_effort"] == "high"
+    assert request["response_format"]["type"] == "json_schema"
+    assert request["response_format"]["json_schema"]["strict"] is True
+
+
+def test_openrouter_only_sends_page_calls_to_providers_that_honour_the_schema():
+    client = FakeOpenAI(content='{"has_content": true}')
+    OpenRouterBackend(effort="medium", client=client).ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+    OpenRouterBackend(client=client).ask("SYSTEM", "notes")
+
+    page, summary = client.requests
+    assert page["extra_body"] == {"reasoning": {"effort": "medium"}, "provider": {"require_parameters": True}}
+    assert "reasoning_effort" not in page and page["response_format"]["json_schema"]["schema"] == PAGE_SCHEMA
+    assert "extra_body" not in summary and "response_format" not in summary
+
+
+def test_openrouter_errors_inside_a_200_answer_are_retried():
+    no_choices = _Obj(choices=None, model_extra={"error": {"code": 502, "message": "upstream went away"}})
+    broke_off = _Obj(choices=[_Obj(message=_Obj(content='{"has', refusal=None), finish_reason="error")],
+                     model_extra={})
+
+    with pytest.raises(TransientError, match="upstream went away"):
+        OpenRouterBackend(client=FakeOpenAI(response=no_choices)).ask("SYSTEM", "prompt", PAGE_SCHEMA)
+    with pytest.raises(TransientError, match="partway"):
+        OpenRouterBackend(client=FakeOpenAI(response=broke_off)).ask("SYSTEM", "prompt", PAGE_SCHEMA)
+
+
+@pytest.mark.parametrize("backend_class", [OpenAIBackend, XAIBackend, OpenRouterBackend])
+@pytest.mark.parametrize("kind, message, code, expected", [
+    ("RateLimitError", "You exceeded your current quota", 429, UsageLimitError),
+    ("RateLimitError", "Rate limit reached for requests", 429, TransientError),
+    ("AuthenticationError", "Incorrect API key", 401, SetupError),
+    ("APIStatusError", "Insufficient credits. Add more credits and retry the request.", 402, UsageLimitError),
+    ("PermissionDeniedError", "Your team has run out of credits or hit its spending limit", 403, UsageLimitError),
+    ("PermissionDeniedError", "Flagged by moderation", 403, BackendError),
+    ("NotFoundError", "The model does not exist", 404, SetupError),
+    ("APIStatusError", "Request timed out", 408, TransientError),
+    ("InternalServerError", "Bad gateway", 502, TransientError),
+    ("BadRequestError", "Invalid schema", 400, BackendError),
+    ("connection", "", 0, TransientError),
+])
+def test_api_errors_are_classified(backend_class, kind, message, code, expected):
+    with pytest.raises(expected) as caught:
+        backend_class(client=FakeOpenAI(error=openai_error(kind, message, code))).ask("SYSTEM", "prompt")
+
+    if expected is BackendError:
+        assert type(caught.value) is BackendError  # not retried, not a setup problem
+
+
+def test_openrouter_explains_a_model_that_cannot_return_a_schema():
+    error = openai_error("InternalServerError",
+                         "There is no available model provider that meets your routing requirements", 503)
+
+    with pytest.raises(SetupError, match="supported_parameters=structured_outputs"):
+        OpenRouterBackend(client=FakeOpenAI(error=error)).ask("SYSTEM", "prompt", PAGE_SCHEMA)
+
+
+@pytest.mark.parametrize("backend_class, key", [
+    (OpenAIBackend, "OPENAI_API_KEY"), (XAIBackend, "XAI_API_KEY"), (OpenRouterBackend, "OPENROUTER_API_KEY"),
+])
+def test_a_missing_api_key_explains_the_plan_backends(backend_class, key, monkeypatch):
+    monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(SetupError, match=f"{key} is not set.*--backend codex"):
+        backend_class().check()
+
+
+class FakeAnthropic:
+    def __init__(self, content=None, stop_reason="end_turn", error=None, stop_details=None):
+        self.content = content if content is not None else []
+        self.stop_reason, self.error, self.stop_details, self.requests = stop_reason, error, stop_details, []
+        self.messages = _Obj(stream=self.stream)
+
+    def stream(self, **request):
+        self.requests.append(request)
+        fake = self
+
+        class Stream:
+            def __enter__(self):
+                if fake.error:
+                    raise fake.error
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_final_message(self):
+                usage = _Obj(input_tokens=20, output_tokens=7, cache_read_input_tokens=5,
+                             cache_creation_input_tokens=None)
+                return _Obj(content=fake.content, stop_reason=fake.stop_reason, stop_details=fake.stop_details,
+                            usage=usage)
+
+        return Stream()
+
+
+def text_block(text):
+    return _Obj(type="text", text=text)
+
+
+def test_anthropic_page_calls_use_output_config_with_the_schema_and_no_tools():
+    thinking = _Obj(type="thinking", thinking="")
+    client = FakeAnthropic(content=[thinking, text_block('{"has_content": true, "knowledge": ["a"]}')])
+    reply = AnthropicBackend(effort="low", client=client).ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+
+    request = client.requests[0]
+    assert request["model"] == "claude-opus-5-5"
+    assert request["system"] == "SYSTEM"
+    assert request["messages"] == [{"role": "user", "content": PAGE_TEXT}]
+    assert request["output_config"] == {"effort": "low", "format": {"type": "json_schema", "schema": PAGE_SCHEMA}}
+    assert request["max_tokens"] == backends.ANTHROPIC_MAX_TOKENS
+    for unsupported in ("tools", "tool_choice", "temperature", "top_p", "top_k", "thinking"):
+        assert unsupported not in request
+    assert reply.value == {"has_content": True, "knowledge": ["a"]}
+    assert reply.usage == {"prompt_tokens": 25, "completion_tokens": 7, "total_tokens": 32}
+
+
+def test_anthropic_summary_calls_return_markdown_without_output_config():
+    client = FakeAnthropic(content=[text_block("  ## Summary  ")])
+    reply = AnthropicBackend(model="claude-haiku-5-5", client=client).ask("SYSTEM", "notes")
+
+    assert reply.value == "## Summary"
+    assert client.requests[0]["model"] == "claude-haiku-5-5" and "output_config" not in client.requests[0]
+
+
+def test_anthropic_refusals_and_cut_off_answers_are_not_parsed():
+    details = _Obj(category=None, explanation="not this one")
+
+    with pytest.raises(TransientError, match="not this one"):
+        AnthropicBackend(client=FakeAnthropic(content=[text_block("{")], stop_reason="refusal",
+                                              stop_details=details)).ask("SYSTEM", "p", PAGE_SCHEMA)
+    with pytest.raises(TransientError, match="cut off"):
+        AnthropicBackend(client=FakeAnthropic(content=[text_block('{"has')], stop_reason="max_tokens")).ask(
+            "SYSTEM", "p", PAGE_SCHEMA)
+
+
+def anthropic_error(kind, message, code):
+    import anthropic
+    import httpx2
+
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    if kind == "connection":
+        return anthropic.APIConnectionError(request=request)
+    return getattr(anthropic, kind)(message, response=httpx2.Response(code, request=request), body=None)
+
+
+@pytest.mark.parametrize("kind, message, code, expected", [
+    ("AuthenticationError", "invalid x-api-key", 401, SetupError),
+    ("PermissionDeniedError", "Your API key does not have permission", 403, SetupError),
+    ("PermissionDeniedError", "Your credit balance is too low", 403, UsageLimitError),
+    ("BadRequestError", "Your credit balance is too low to access the Anthropic API", 400, UsageLimitError),
+    ("APIStatusError", "billing_error", 402, UsageLimitError),
+    ("NotFoundError", "model: claude-nope", 404, SetupError),
+    ("RateLimitError", "Number of request tokens has exceeded your per-minute rate limit", 429, TransientError),
+    ("InternalServerError", "Internal server error", 500, TransientError),
+    ("OverloadedError", "Overloaded", 529, TransientError),
+    ("BadRequestError", "output_config.format.schema: unsupported", 400, BackendError),
+    ("connection", "", 0, TransientError),
+])
+def test_anthropic_errors_are_classified(kind, message, code, expected):
+    with pytest.raises(expected) as caught:
+        AnthropicBackend(client=FakeAnthropic(error=anthropic_error(kind, message, code))).ask("SYSTEM", "p")
+
+    if expected is BackendError:
+        assert type(caught.value) is BackendError
+
+
+def test_anthropic_without_credentials_is_a_clear_setup_error(monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(backends.shutil, "which", lambda _name: None)
+
+    with pytest.raises(SetupError, match="ANTHROPIC_API_KEY is not set"):
+        AnthropicBackend().check()
+
+
+# --- the real SDKs, offline: what each provider would receive on the wire -----------------------------
+
+
+class Wire:
+    """A stand-in HTTP server for the real openai and anthropic SDKs."""
+
+    def __init__(self, status=200, body=None, sse=None):
+        self.status, self.body, self.sse, self.requests = status, body, sse, []
+
+    def handler(self, httpx_module):
+        def handle(request):
+            self.requests.append(request)
+            if self.sse is not None:
+                return httpx_module.Response(self.status, headers={"content-type": "text/event-stream"},
+                                             content=self.sse.encode())
+            return httpx_module.Response(self.status, json=self.body)
+
+        return handle
+
+    def sent(self):
+        request = self.requests[-1]
+        return str(request.url), request.headers, json.loads(request.content)
+
+
+def chat_answer(content):
+    return {
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": content, "refusal": None}}],
+        "usage": {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12},
+    }
+
+
+@pytest.fixture
+def openai_wire(monkeypatch):
     import httpx
     import openai
 
-    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    wire = Wire(body=chat_answer('{"has_content": true}'))
+    real = openai.OpenAI
+    monkeypatch.setattr(openai, "OpenAI", lambda **kw: real(
+        **kw, http_client=httpx.Client(transport=httpx.MockTransport(wire.handler(httpx)))))
+    for name in ("OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.setenv(name, f"test-{name}")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    return wire
 
-    def response(code):
-        return httpx.Response(code, request=request)
 
-    cases = [
-        (openai.RateLimitError("You exceeded your current quota", response=response(429), body=None),
-         UsageLimitError),
-        (openai.RateLimitError("Rate limit reached for requests", response=response(429), body=None),
-         TransientError),
-        (openai.AuthenticationError("Incorrect API key", response=response(401), body=None), SetupError),
-        (openai.APIConnectionError(request=request), TransientError),
+def test_openrouter_on_the_wire(openai_wire):
+    reply = OpenRouterBackend(effort="low").ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+
+    url, headers, body = openai_wire.sent()
+    assert url == "https://openrouter.ai/api/v1/chat/completions"
+    assert headers["authorization"] == "Bearer test-OPENROUTER_API_KEY"
+    assert headers["x-openrouter-title"] == "AI reads books page by page"
+    assert body["model"] == backends.OPENROUTER_PAGE_MODEL
+    assert body["provider"] == {"require_parameters": True} and body["reasoning"] == {"effort": "low"}
+    assert body["response_format"]["json_schema"]["strict"] is True and "reasoning_effort" not in body
+    assert reply.value == {"has_content": True} and reply.usage["total_tokens"] == 12
+
+
+def test_openrouter_error_body_with_status_200_on_the_wire(openai_wire):
+    openai_wire.body = {"error": {"code": 502, "message": "Provider returned error"}}
+
+    with pytest.raises(TransientError, match="Provider returned error"):
+        OpenRouterBackend().ask("SYSTEM", "prompt", PAGE_SCHEMA)
+
+
+def test_xai_and_openai_on_the_wire(openai_wire):
+    XAIBackend(effort="high").ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+    url, headers, body = openai_wire.sent()
+    assert url == "https://api.x.ai/v1/chat/completions"
+    assert headers["authorization"] == "Bearer test-XAI_API_KEY"
+    assert (body["model"], body["reasoning_effort"]) == ("grok-4.7", "high")
+    assert body["response_format"]["type"] == "json_schema"
+
+    OpenAIBackend().ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+    url, headers, body = openai_wire.sent()
+    assert url == "https://api.openai.com/v1/chat/completions"
+    assert headers["authorization"] == "Bearer test-OPENAI_API_KEY"
+    assert body["model"] == backends.OPENAI_PAGE_MODEL and "x-openrouter-title" not in headers
+
+
+def test_a_402_from_the_wire_stops_the_reader(openai_wire):
+    openai_wire.status, openai_wire.body = 402, {"error": {"code": 402, "message": "Insufficient credits"}}
+
+    with pytest.raises(UsageLimitError):
+        OpenRouterBackend().ask("SYSTEM", "prompt")
+
+
+def anthropic_sse(text, stop_reason="end_turn"):
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 30, "output_tokens": 1}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "signature_delta", "signature": "sig"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("content_block_start", {"type": "content_block_start", "index": 1,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 1,
+                                 "delta": {"type": "text_delta", "text": text}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 1}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                           "usage": {"output_tokens": 9}}),
+        ("message_stop", {"type": "message_stop"}),
     ]
-    for error, expected in cases:
-        with pytest.raises(expected):
-            OpenAIBackend(client=FakeOpenAI(error=error)).ask("SYSTEM", "prompt")
+    return "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
 
 
-def test_openai_check_explains_the_plan_backends(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+@pytest.fixture
+def anthropic_wire(monkeypatch):
+    import anthropic
+    import httpx2
 
-    with pytest.raises(SetupError, match="--backend codex"):
-        OpenAIBackend().check()
+    wire = Wire(sse=anthropic_sse('{"has_content": true, "page_gist": "g", "knowledge": ["k"]}'))
+    real = anthropic.Anthropic
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: real(
+        **kw, http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(wire.handler(httpx2)))))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    return wire
+
+
+def test_anthropic_on_the_wire(anthropic_wire):
+    reply = AnthropicBackend(effort="medium").ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+
+    url, headers, body = anthropic_wire.sent()
+    assert url == "https://api.anthropic.com/v1/messages"
+    assert headers["x-api-key"] == "test-anthropic-key"
+    assert body["stream"] is True and body["model"] == "claude-opus-5-5" and body["system"] == "SYSTEM"
+    assert body["output_config"] == {"effort": "medium", "format": {"type": "json_schema", "schema": PAGE_SCHEMA}}
+    assert body["messages"] == [{"role": "user", "content": PAGE_TEXT}]
+    assert reply.value == {"has_content": True, "page_gist": "g", "knowledge": ["k"]}
+    assert reply.usage == {"prompt_tokens": 30, "completion_tokens": 9, "total_tokens": 39}
+
+
+def test_anthropic_overloaded_on_the_wire_is_retried(anthropic_wire):
+    anthropic_wire.sse = None
+    anthropic_wire.status = 529
+    anthropic_wire.body = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+
+    with pytest.raises(TransientError, match="Overloaded"):
+        AnthropicBackend().ask("SYSTEM", "prompt")
+
+
+def test_a_rejected_key_is_never_echoed_back():
+    message = ("Incorrect API key provided: sk-proj-****************************jCcA. "
+               "You can find your API key at https://platform.openai.com/account/api-keys.")
+    error = openai_error("AuthenticationError", message, 401)
+
+    with pytest.raises(SetupError) as caught:
+        OpenAIBackend(client=FakeOpenAI(error=error)).ask("SYSTEM", "prompt")
+
+    assert "jCcA" not in str(caught.value) and "sk-proj" not in str(caught.value)
+    assert "[key hidden]" in str(caught.value) and "platform.openai.com/account/api-keys" in str(caught.value)
+    assert backends._redact("xai-AbCdEf123456 and sk-ant-api03-abcDEF_123") == "[key hidden] and [key hidden]"
