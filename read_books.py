@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Page-by-page PDF knowledge extraction with resumable, bounded summarization."""
+"""AI reads books page by page.
+
+The AI reads a PDF the way a person studies a book: one page at a time. With each page
+it sees only that page, the last lines of the page before, and its own notes so far.
+It writes down what it learned (every note tagged with its page), and every few pages
+it writes down what it understands so far. At the end it pulls the whole book together.
+
+Run it on the OpenAI API, or on the Claude, ChatGPT (Codex) or Grok plan you already
+have. See `python read_books.py --help`.
+"""
 
 from __future__ import annotations
 
@@ -8,25 +17,157 @@ import hashlib
 import json
 import re
 import shutil
+import sys
+import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-import fitz  # PyMuPDF
-from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from termcolor import colored
 
-DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_ANALYSIS_MODEL = "gpt-4o-mini"
+from backends import (
+    API_PAGE_MODEL,
+    API_SUMMARY_MODEL,
+    BACKENDS,
+    DEFAULT_TIMEOUT,
+    Backend,
+    BackendError,
+    SetupError,
+    TransientError,
+    UsageLimitError,
+    make_backend,
+)
+
+# source for the infinite descent book: https://infinitedescent.xyz/dl/infdesc.pdf
+
+DEFAULT_PDF = Path("meditations.pdf")
 DEFAULT_BASE_DIR = Path("book_analysis")
+DEFAULT_INTERVAL = 20         # write "what I understand so far" every N pages (0 = never)
+DEFAULT_CONTEXT_WINDOW = 8    # how many of its most recent notes the reader sees with each page
+RECENT_PAGE_GISTS = 5         # one-line memories of the last few pages
+PREVIOUS_PAGE_TAIL = 600      # characters from the end of the previous page, for sentences that run over
+UNDERSTANDING_CHARS = 6_000   # how much of the running understanding goes along with each page
+SUMMARY_CHUNK_SIZE = 300      # most notes in one summary request
+SUMMARY_CHUNK_CHARS = 100_000  # most characters of notes in one summary request
+SUMMARY_MAX_ITEM_CHARS = 8_000
 
 
 class PageContent(BaseModel):
     has_content: bool
-    knowledge: list[str]
+    page_gist: str = ""
+    knowledge: list[str] = []
+
+
+# The same shape as PageContent, written out so every backend gets an identical, strict schema.
+PAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "has_content": {
+            "type": "boolean",
+            "description": "false for pages to skip (contents, index, blank, copyright, bibliography...)",
+        },
+        "page_gist": {
+            "type": "string",
+            "description": "one sentence: what this page adds to the book so far (empty when skipped)",
+        },
+        "knowledge": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "new, standalone, learnable points from this page (empty when skipped)",
+        },
+    },
+    "required": ["has_content", "page_gist", "knowledge"],
+    "additionalProperties": False,
+}
+
+PAGE_SYSTEM_PROMPT = """You are reading a book one page at a time, the way a careful person studies it. \
+You see only the current page, the last lines of the page before it, and your own notes from the pages you \
+have read so far. You never see the rest of the book.
+
+SKIP the page if it contains:
+- Table of contents
+- Chapter listings
+- Index pages
+- Blank pages
+- Copyright information
+- Publishing details
+- References or bibliography
+- Acknowledgments
+
+DO extract knowledge if the page contains:
+- Preface content that explains important concepts
+- Actual educational content
+- Key definitions and concepts
+- Important arguments or theories
+- Examples and case studies
+- Significant findings or conclusions
+- Methodologies or frameworks
+- Critical analyses or interpretations
+
+For valid content:
+- Set has_content to true
+- Write page_gist: one sentence on what this page adds to the book so far
+- Extract detailed, learnable knowledge points; each one must make sense on its own
+- Include important quotes or key statements
+- Capture examples with their context
+- Preserve technical terms and definitions
+- Use your notes to connect ideas: when this page continues or answers something from an earlier page, \
+say so in the point
+- Do not repeat a point that is already in your notes; add only what is new on this page
+
+For pages to skip:
+- Set has_content to false
+- Return an empty page_gist and an empty knowledge list
+
+Answer only with the JSON object."""
+
+MARKDOWN_STYLE = """Use markdown formatting:
+- ## for main sections
+- ### for subsections
+- Bullet points for lists
+- `code blocks` for any code or formulas
+- **bold** for emphasis
+- *italic* for terminology
+- > blockquotes for important notes
+
+Return only the markdown, nothing else. Do not say 'here is the summary' or anything like that before or after."""
+
+UNDERSTANDING_SYSTEM_PROMPT = f"""You are reading a book page by page and keeping track of what you understand so far.
+You get what you understood before (if anything) and the notes you took on the pages since, each tagged with \
+its page number. Write your updated understanding of the book so far:
+- Keep what still matters from before, and revise anything the new pages changed or deepened
+- Show how the ideas connect and develop across the pages, with page references like (p. 34)
+- End with a short "### Threads to follow" list: questions or ideas you expect the book to develop next
+- Write only from the notes; do not add outside knowledge about the book
+- Stay concise but detailed: at most about 1,000 words
+
+{MARKDOWN_STYLE}"""
+
+PART_SYSTEM_PROMPT = f"""You have finished reading a book page by page. Here are your notes from one part of it, \
+each tagged with its page number. Summarise this part in a concise but detailed way, keeping the key ideas, \
+definitions, examples and quotes, with page references like (p. 34). Write only from the notes.
+
+{MARKDOWN_STYLE}"""
+
+FINAL_SYSTEM_PROMPT = f"""You have finished reading a book page by page. Create a comprehensive summary that pulls \
+the whole book together, in a concise but detailed way:
+- The main ideas, and how they build on each other from the first page you read to the last
+- Key definitions, arguments, examples and important quotes, with page references like (p. 34)
+- Write only from your notes and your running understanding; do not add outside knowledge about the book
+
+{MARKDOWN_STYLE}"""
+
+
+@dataclass
+class PageReading:
+    has_content: bool
+    gist: str
+    points: list[str]
+    usage: dict[str, int] = field(default_factory=dict)
+    seconds: float = 0.0
 
 
 @dataclass
@@ -37,11 +178,14 @@ class APIResult:
 
 def empty_state() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "document_id": None,
         "last_completed_page": 0,
         "knowledge": [],
+        "reading_log": [],
+        "understanding": None,
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "reading_seconds": 0.0,
         "last_interval_summary_page": 0,
         "final_summary_page": 0,
     }
@@ -123,19 +267,6 @@ def file_digest(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def usage_dict(response: Any) -> dict[str, int]:
-    usage = getattr(response, "usage", None)
-    result: dict[str, int] = {}
-    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        if isinstance(usage, dict):
-            value = usage.get(name)
-        else:
-            value = getattr(usage, name, None)
-        if isinstance(value, int):
-            result[name] = value
-    return result
-
-
 def add_usage(total: dict[str, int], usage: dict[str, int]) -> None:
     for name, value in usage.items():
         total[name] = total.get(name, 0) + value
@@ -146,143 +277,242 @@ def call_with_retry(
     max_retries: int = 3,
     backoff: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
+    on_retry: Callable[[Exception, float], None] | None = None,
 ) -> Any:
+    """Retry timeouts, network errors and malformed answers; never retry setup or usage-limit errors."""
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
     for attempt in range(max_retries + 1):
         try:
             return operation()
-        except (
-            ConnectionError,
-            TimeoutError,
-            APIConnectionError,
-            APITimeoutError,
-            RateLimitError,
-            InternalServerError,
-        ):
+        except (ConnectionError, TimeoutError, TransientError) as exc:
             if attempt == max_retries:
                 raise
-            sleep(backoff * (2**attempt))
+            delay = backoff * (2**attempt)
+            if on_retry:
+                on_retry(exc, delay)
+            sleep(delay)
     raise AssertionError("unreachable")
 
 
+def _say_retry(exc: Exception, delay: float) -> None:
+    print(colored(f"   🔁 {exc} (trying again in {delay:.0f} s)", "yellow"))
+
+
+def _note_line(item: dict[str, Any], limit: int | None = None) -> str:
+    line = f"[page {item.get('page') or '?'}] {item['text']}"
+    return line[:limit] if limit else line
+
+
+def page_prompt(
+    page_text: str,
+    page_number: int,
+    *,
+    page_count: int | None = None,
+    book_name: str | None = None,
+    recent_knowledge: Sequence[dict[str, Any]] = (),
+    recent_pages: Sequence[dict[str, Any]] = (),
+    understanding: dict[str, Any] | None = None,
+    previous_page_end: str = "",
+) -> str:
+    """Everything the reader sees for one page: the page itself and bounded notes from before."""
+    of_total = f" of {page_count}" if page_count else ""
+    parts = [f"Book: {book_name}, page {page_number}{of_total}" if book_name else f"Page {page_number}{of_total}"]
+    if understanding and understanding.get("text"):
+        text = understanding["text"]
+        if len(text) > UNDERSTANDING_CHARS:
+            text = text[:UNDERSTANDING_CHARS] + "\n[...]"
+        parts.append(
+            f"What you understood after page {understanding.get('page')}:\n<understanding>\n{text}\n</understanding>"
+        )
+    gists = [entry for entry in recent_pages if entry.get("gist")]
+    if gists:
+        parts.append(
+            "What the last pages you read were about:\n"
+            + "\n".join(f"[page {entry['page']}] {entry['gist']}" for entry in gists)
+        )
+    notes = "\n".join(_note_line(item) for item in recent_knowledge) or "(none yet)"
+    parts.append(f"Your most recent notes:\n{notes}")
+    if previous_page_end.strip():
+        parts.append(
+            f"The last lines of page {page_number - 1}:\n<previous_page_end>\n{previous_page_end.strip()}\n"
+            "</previous_page_end>"
+        )
+    parts.append(f"Now read page {page_number}:\n<page>\n{page_text.strip() or '(this page has no text)'}\n</page>")
+    return "\n\n".join(parts)
+
+
 def extract_page_knowledge(
-    client: Any,
+    backend: Backend,
     page_text: str,
     recent_knowledge: Sequence[dict[str, Any]],
     page_number: int,
     *,
-    model: str = DEFAULT_MODEL,
+    page_count: int | None = None,
+    book_name: str | None = None,
+    recent_pages: Sequence[dict[str, Any]] = (),
+    understanding: dict[str, Any] | None = None,
+    previous_page_end: str = "",
     max_retries: int = 3,
     backoff: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
-) -> APIResult:
-    context = "\n".join(
-        f"[page {item.get('page', '?')}] {item['text']}" for item in recent_knowledge
-    ) or "(none)"
-    user_prompt = (
-        f"Recent bounded knowledge context:\n{context}\n\n"
-        f"Current page {page_number}:\n{page_text}"
+    on_retry: Callable[[Exception, float], None] | None = None,
+) -> PageReading:
+    """Read one page: one model call that sees only this page and the reader's bounded notes."""
+    prompt = page_prompt(
+        page_text,
+        page_number,
+        page_count=page_count,
+        book_name=book_name,
+        recent_knowledge=recent_knowledge,
+        recent_pages=recent_pages,
+        understanding=understanding,
+        previous_page_end=previous_page_end,
     )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Study this single book page. Skip blank, contents, index, copyright, "
-                "publishing, bibliography and acknowledgments pages. Extract detailed, "
-                "standalone learnable facts from educational content. The recent context "
-                "is only for continuity: do not repeat facts already present."
-            ),
-        },
-        {"role": "user", "content": user_prompt},
-    ]
 
-    response = call_with_retry(
-        lambda: client.beta.chat.completions.parse(
-            model=model, messages=messages, response_format=PageContent
-        ),
-        max_retries=max_retries,
-        backoff=backoff,
-        sleep=sleep,
-    )
-    parsed = response.choices[0].message.parsed
-    points = parsed.knowledge if parsed and parsed.has_content else []
-    return APIResult(points, usage_dict(response))
+    def read() -> tuple[PageContent, Any]:
+        reply = backend.ask(PAGE_SYSTEM_PROMPT, prompt, PAGE_SCHEMA)
+        try:
+            return PageContent.model_validate(reply.value), reply
+        except ValidationError as exc:
+            raise TransientError(f"The page notes did not match the schema: {exc.errors()[0]['msg']}") from exc
+
+    parsed, reply = call_with_retry(read, max_retries=max_retries, backoff=backoff, sleep=sleep, on_retry=on_retry)
+    points = [point.strip() for point in parsed.knowledge if point.strip()] if parsed.has_content else []
+    gist = parsed.page_gist.strip() if parsed.has_content else ""
+    return PageReading(bool(parsed.has_content), gist, points, reply.usage, reply.seconds)
 
 
-def _tagged(items: Sequence[str]) -> str:
-    return "\n".join(f"<item>{item}</item>" for item in items)
+def chunk_items(items: Sequence[str], max_items: int, max_chars: int) -> list[list[str]]:
+    """Split notes into requests that respect both an item count and a character budget."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for item in items:
+        if current and (len(current) >= max_items or size + len(item) > max_chars):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(item)
+        size += len(item)
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def _summary_call(
-    client: Any,
-    items: Sequence[str],
+def _ask_text(backend: Backend, system: str, prompt: str, *, max_retries: int, backoff: float,
+              sleep: Callable[[float], None], on_retry: Callable[[Exception, float], None] | None) -> Any:
+    def ask() -> Any:
+        reply = backend.ask(system, prompt)
+        if not str(reply.value).strip():
+            raise TransientError("The summary came back empty")
+        return reply
+
+    return call_with_retry(ask, max_retries=max_retries, backoff=backoff, sleep=sleep, on_retry=on_retry)
+
+
+def update_understanding(
+    backend: Backend,
+    understanding: dict[str, Any] | None,
+    new_knowledge: Sequence[dict[str, Any]],
+    page_number: int,
     *,
-    model: str,
-    max_retries: int,
-    backoff: float,
-    sleep: Callable[[float], None],
+    book_name: str | None = None,
+    page_count: int | None = None,
+    chunk_size: int = SUMMARY_CHUNK_SIZE,
+    chunk_chars: int = SUMMARY_CHUNK_CHARS,
+    max_item_chars: int = SUMMARY_MAX_ITEM_CHARS,
+    max_retries: int = 3,
+    backoff: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    on_retry: Callable[[Exception, float], None] | None = None,
 ) -> APIResult:
-    response = call_with_retry(
-        lambda: client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Merge these bounded items into a concise, detailed Markdown summary. "
-                        "Preserve source page references. Return only Markdown."
-                    ),
-                },
-                {"role": "user", "content": _tagged(items)},
-            ],
-        ),
-        max_retries=max_retries,
-        backoff=backoff,
-        sleep=sleep,
-    )
-    return APIResult(response.choices[0].message.content or "", usage_dict(response))
+    """Fold the notes since the last update into "what I understand so far after page N".
+
+    Each request holds the previous understanding plus a bounded batch of new notes, so it
+    stays the same size however long the book is.
+    """
+    text = (understanding or {}).get("text") or ""
+    since = (understanding or {}).get("page")
+    usage: dict[str, int] = {}
+    lines = [_note_line(item, max_item_chars) for item in new_knowledge]
+    of_total = f" of {page_count}" if page_count else ""
+    for chunk in chunk_items(lines, chunk_size, max(chunk_chars, 2 * max_item_chars)):
+        before = (
+            f"What you understood after page {since}:\n<understanding>\n{text}\n</understanding>"
+            if text
+            else "This is your first look back: you have not written down your understanding yet."
+        )
+        prompt = (
+            f"Book: {book_name or 'this book'}. You have now read up to page {page_number}{of_total}.\n\n"
+            f"{before}\n\nYour notes from the pages since:\n<notes>\n" + "\n".join(chunk) + "\n</notes>\n\n"
+            f"Write what you understand so far, after page {page_number}."
+        )
+        reply = _ask_text(backend, UNDERSTANDING_SYSTEM_PROMPT, prompt, max_retries=max_retries,
+                          backoff=backoff, sleep=sleep, on_retry=on_retry)
+        text = str(reply.value).strip()
+        since = page_number
+        add_usage(usage, reply.usage)
+    return APIResult(text, usage)
 
 
-def hierarchical_summary(
-    client: Any,
+def final_summary(
+    backend: Backend,
     knowledge: Sequence[dict[str, Any]],
     *,
-    model: str = DEFAULT_ANALYSIS_MODEL,
-    chunk_size: int = 20,
-    max_item_chars: int = 8_000,
+    understanding: dict[str, Any] | None = None,
+    book_name: str | None = None,
+    pages: tuple[int, int] | None = None,
+    chunk_size: int = SUMMARY_CHUNK_SIZE,
+    chunk_chars: int = SUMMARY_CHUNK_CHARS,
+    max_item_chars: int = SUMMARY_MAX_ITEM_CHARS,
     max_retries: int = 3,
     backoff: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
+    on_retry: Callable[[Exception, float], None] | None = None,
 ) -> APIResult:
-    """Map/reduce summaries so no model request exceeds chunk_size items."""
+    """Pull the whole book together from every page-tagged note.
+
+    Most books fit in one request. A very long book is summarised part by part first
+    (map/reduce), so no request ever grows past the chunk bounds.
+    """
     if chunk_size < 2:
         raise ValueError("summary chunk size must be >= 2")
     if max_item_chars < 100:
         raise ValueError("max_item_chars must be >= 100")
     if not knowledge:
         return APIResult("", {})
-    layer = [
-        f"[page {item.get('page', '?')}] {item['text']}"[:max_item_chars]
-        for item in knowledge
-    ]
-    total_usage: dict[str, int] = {}
+    chunk_chars = max(chunk_chars, 2 * max_item_chars)  # every request holds at least two items
+    asked = dict(max_retries=max_retries, backoff=backoff, sleep=sleep, on_retry=on_retry)
+    usage: dict[str, int] = {}
+    layer = [_note_line(item, max_item_chars) for item in knowledge]
+    label = "notes"
     while True:
-        next_layer: list[str] = []
-        for offset in range(0, len(layer), chunk_size):
-            result = _summary_call(
-                client,
-                layer[offset : offset + chunk_size],
-                model=model,
-                max_retries=max_retries,
-                backoff=backoff,
-                sleep=sleep,
-            )
-            next_layer.append(result.value[:max_item_chars])
-            add_usage(total_usage, result.usage)
-        if len(next_layer) == 1:
-            return APIResult(next_layer[0], total_usage)
-        layer = next_layer
+        chunks = chunk_items(layer, chunk_size, chunk_chars)
+        if len(chunks) == 1:
+            break
+        print(colored(f"   🧩 Summarising {len(chunks)} parts of the book first...", "cyan"))
+        next_layer = []
+        for chunk in chunks:
+            prompt = f"Book: {book_name or 'this book'}.\n\nYour {label}:\n<notes>\n" + "\n".join(chunk) + "\n</notes>"
+            reply = _ask_text(backend, PART_SYSTEM_PROMPT, prompt, **asked)
+            add_usage(usage, reply.usage)
+            next_layer.append(f"<part>\n{str(reply.value).strip()[:max_item_chars]}\n</part>")
+        layer, label = next_layer, "summaries of each part"
+    span = f"pages {pages[0]}–{pages[1]}" if pages else "the pages you read"
+    guide = ""
+    if understanding and understanding.get("text"):
+        guide = (
+            f"Your running understanding (written after page {understanding.get('page')}):\n"
+            f"<understanding>\n{understanding['text']}\n</understanding>\n\n"
+        )
+    prompt = (
+        f"Book: {book_name or 'this book'}. You have finished reading {span}.\n\n{guide}"
+        f"Your {label}:\n<notes>\n" + "\n".join(chunks[0]) + "\n</notes>\n\n"
+        "Write the final summary that pulls the whole book together."
+    )
+    reply = _ask_text(backend, FINAL_SYSTEM_PROMPT, prompt, **asked)
+    add_usage(usage, reply.usage)
+    return APIResult(str(reply.value).strip(), usage)
 
 
 def pymupdf_ocr(page: Any) -> str:
@@ -322,15 +552,25 @@ def save_summary(
     *,
     kind: str,
     page_number: int,
+    page_count: int | None = None,
+    first_page: int = 1,
+    written_by: str | None = None,
 ) -> Path | None:
     if not summary:
         return None
     summaries_dir.mkdir(parents=True, exist_ok=True)
     path = summaries_dir / f"{Path(book_name).stem}_{kind}.md"
+    of_total = f" of {page_count}" if page_count else ""
+    if kind == "final":
+        title = f"## The whole book, pulled together (pages {first_page}–{page_number}{of_total})"
+    else:
+        title = f"## What I understand so far, after page {page_number}{of_total}"
+    by = f" by {written_by}" if written_by else ""
     content = (
-        f"# Book Analysis: {book_name}\n\n"
-        f"Generated: {datetime.now().isoformat(timespec='seconds')}  \n"
-        f"Processed through page: {page_number}\n\n{summary}\n"
+        f"# Book Analysis: {book_name}\n{title}\n\n"
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}{by}  \n"
+        f"Processed through page: {page_number}\n\n{summary}\n\n"
+        "---\n*Read page by page with [AI reads books](https://github.com/echohive42/AI-reads-books-page-by-page)*\n"
     )
     path.write_text(content, encoding="utf-8")
     return path
@@ -342,31 +582,47 @@ def _unwrap_result(result: Any) -> tuple[Any, dict[str, int]]:
     return result, {}
 
 
+def _show_points(points: Sequence[str], shown: int = 3, width: int = 110) -> None:
+    for point in points[:shown]:
+        print(colored("      • " + textwrap.shorten(point, width=width, placeholder="…"), "white"))
+    if len(points) > shown:
+        print(colored(f"      … and {len(points) - shown} more", "white"))
+
+
+def _normalise(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
 def run_analysis(
     document: Any,
-    client: Any,
+    reader: Backend,
     state_path: Path,
     summaries_dir: Path,
-    extractor: Callable[..., Any] = extract_page_knowledge,
-    summarizer: Callable[..., Any] = hierarchical_summary,
+    *,
+    summary_backend: Backend | None = None,
+    book_name: str | None = None,
     max_pages: int | None = None,
+    start_page: int = 1,
     resume: bool = True,
-    context_window: int = 8,
-    interval: int | None = None,
-    model: str = DEFAULT_MODEL,
-    analysis_model: str = DEFAULT_ANALYSIS_MODEL,
-    summary_chunk_size: int = 20,
-    summary_max_item_chars: int = 8_000,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    interval: int | None = DEFAULT_INTERVAL,
+    summary_chunk_size: int = SUMMARY_CHUNK_SIZE,
+    summary_chunk_chars: int = SUMMARY_CHUNK_CHARS,
+    summary_max_item_chars: int = SUMMARY_MAX_ITEM_CHARS,
     ocr: str = "off",
     ocr_engine: Callable[[Any], str] | None = None,
     max_retries: int = 3,
     backoff: float = 1.0,
     document_id: str | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     if context_window < 0:
         raise ValueError("context_window must be >= 0")
-    if interval is not None and interval <= 0:
-        raise ValueError("interval must be > 0")
+    if interval is not None and interval < 0:
+        raise ValueError("interval must be >= 0")
+    if start_page < 1:
+        raise ValueError("start_page must be >= 1")
+    summarizer = summary_backend or reader
     state = load_state(state_path) if resume else empty_state()
     if not resume:
         # Persist the fresh checkpoint before any API call. If page 1 fails,
@@ -376,9 +632,12 @@ def run_analysis(
         raise RuntimeError("Cannot resume: state belongs to a different PDF; use --reset")
     if document_id:
         state["document_id"] = document_id
-    limit = min(document.page_count, max_pages if max_pages is not None else document.page_count)
-    start = min(state["last_completed_page"], limit)
-    book_name = state_path.name.removesuffix("_knowledge.json") + ".pdf"
+    book_name = book_name or state_path.name.removesuffix("_knowledge.json") + ".pdf"
+    page_count = document.page_count
+    limit = page_count if max_pages is None else min(page_count, start_page - 1 + max_pages)
+    start = min(max(state["last_completed_page"], start_page - 1), limit)
+    retry = dict(max_retries=max_retries, backoff=backoff, sleep=sleep, on_retry=_say_retry)
+    bounds = dict(chunk_size=summary_chunk_size, chunk_chars=summary_chunk_chars, max_item_chars=summary_max_item_chars)
 
     def generate_interval_summary(page_number: int) -> None:
         recent = [
@@ -386,24 +645,33 @@ def run_analysis(
             for item in state["knowledge"]
             if state["last_interval_summary_page"] < (item.get("page") or 0) <= page_number
         ]
-        summary_result = summarizer(
-            client,
-            recent,
-            model=analysis_model,
-            chunk_size=summary_chunk_size,
-            max_item_chars=summary_max_item_chars,
-            max_retries=max_retries,
-            backoff=backoff,
-        )
-        summary, summary_usage = _unwrap_result(summary_result)
-        save_summary(
-            summaries_dir,
-            book_name,
-            summary,
-            kind=f"interval_{page_number:05d}",
-            page_number=page_number,
-        )
-        add_usage(state["usage"], summary_usage)
+        if recent:
+            print(colored(f"\n📊 Progress: {page_number}/{page_count} pages read", "cyan"))
+            print(colored(f"🤔 Updating what I understand so far ({len(recent)} new notes)...", "cyan"))
+            result = update_understanding(
+                summarizer,
+                state["understanding"],
+                recent,
+                page_number,
+                book_name=book_name,
+                page_count=page_count,
+                **bounds,
+                **retry,
+            )
+            summary, summary_usage = _unwrap_result(result)
+            path = save_summary(
+                summaries_dir,
+                book_name,
+                summary,
+                kind=f"interval_{page_number:05d}",
+                page_number=page_number,
+                page_count=page_count,
+                written_by=summarizer.label(),
+            )
+            if summary:
+                state["understanding"] = {"page": page_number, "text": summary}
+                print(colored(f"✨ What I understand so far, saved to: {path}", "green"))
+            add_usage(state["usage"], summary_usage)
         state["last_interval_summary_page"] = page_number
         save_state(state_path, state)
 
@@ -415,29 +683,67 @@ def run_analysis(
             generate_interval_summary(next_due)
             next_due += interval
 
+    if start < limit:
+        span = f"page {limit}" if limit == start + 1 else f"pages {start + 1}–{limit}"
+        print(colored(f"\n📚 Reading {span} of {page_count}...", "cyan"))
+    elif state["last_completed_page"] >= limit:
+        print(colored(f"\n📚 Already read through page {state['last_completed_page']}; nothing new to read.", "cyan"))
     for page_index in range(start, limit):
         page_number = page_index + 1
+        print(colored(f"\n📖 Reading page {page_number}/{page_count}...", "yellow"))
         page_text = extract_text(document[page_index], ocr=ocr, ocr_engine=ocr_engine)
-        context = state["knowledge"][-context_window:] if context_window else []
-        raw_result = extractor(
-            client,
-            page_text,
-            context,
-            page_number,
-            model=model,
-            max_retries=max_retries,
-            backoff=backoff,
-        )
-        points, request_usage = _unwrap_result(raw_result)
+        if not page_text.strip():
+            # Nothing to read on this page (blank, or a scan without OCR): no model call needed.
+            reading = PageReading(False, "", [])
+        else:
+            previous_end = document[page_index - 1].get_text()[-PREVIOUS_PAGE_TAIL:] if page_index > 0 else ""
+            reading = extract_page_knowledge(
+                reader,
+                page_text,
+                state["knowledge"][-context_window:] if context_window else [],
+                page_number,
+                page_count=page_count,
+                book_name=book_name,
+                recent_pages=state["reading_log"][-RECENT_PAGE_GISTS:],
+                understanding=state["understanding"],
+                previous_page_end=previous_end,
+                **retry,
+            )
         # Update progress only after extraction returns successfully.
-        existing_texts = {item["text"] for item in state["knowledge"]}
-        for point in points:
-            if point not in existing_texts:
+        existing_texts = {_normalise(item["text"]) for item in state["knowledge"]}
+        new_points = []
+        for point in reading.points:
+            if _normalise(point) not in existing_texts:
                 state["knowledge"].append({"page": page_number, "text": point})
-                existing_texts.add(point)
-        add_usage(state["usage"], request_usage)
+                existing_texts.add(_normalise(point))
+                new_points.append(point)
+        state["reading_log"].append(
+            {
+                "page": page_number,
+                "gist": reading.gist,
+                "points": len(new_points),
+                "seconds": round(reading.seconds, 1),
+            }
+        )
+        add_usage(state["usage"], reading.usage)
+        state["reading_seconds"] = round(state["reading_seconds"] + reading.seconds, 1)
         state["last_completed_page"] = page_number
         save_state(state_path, state)
+
+        took = f" · {reading.seconds:.1f} s" if reading.seconds else ""
+        if reading.has_content and new_points:
+            if reading.gist:
+                print(colored("   💭 " + textwrap.shorten(reading.gist, width=120, placeholder="…"), "magenta"))
+            print(colored(
+                f"   ✅ Found {len(new_points)} new knowledge points ({len(state['knowledge'])} so far){took}",
+                "green",
+            ))
+            _show_points(new_points)
+        elif reading.has_content:
+            print(colored(f"   ✅ Nothing new on this page beyond my notes{took}", "green"))
+        else:
+            print(colored(f"   ⏭️  Skipping page (no relevant content){took}", "yellow"))
+        print(colored(f"   💾 Saved knowledge base ({len(state['knowledge'])} items)", "blue"))
 
         if interval and page_number % interval == 0 and page_number < limit:
             generate_interval_summary(page_number)
@@ -449,48 +755,91 @@ def run_analysis(
         and state["last_completed_page"] == limit
         and state["final_summary_page"] != limit
     ):
-        summary_result = summarizer(
-            client,
+        print(colored(f"\n📊 Final page ({limit}/{page_count}) read", "cyan"))
+        print(colored("🤔 Pulling the whole book together...", "cyan"))
+        first_read = min((item["page"] for item in state["knowledge"] if item.get("page")), default=start_page)
+        result = final_summary(
+            summarizer,
             state["knowledge"],
-            model=analysis_model,
-            chunk_size=summary_chunk_size,
-            max_item_chars=summary_max_item_chars,
-            max_retries=max_retries,
-            backoff=backoff,
+            understanding=state["understanding"],
+            book_name=book_name,
+            pages=(first_read, limit),
+            **bounds,
+            **retry,
         )
-        summary, summary_usage = _unwrap_result(summary_result)
-        save_summary(
+        summary, summary_usage = _unwrap_result(result)
+        path = save_summary(
             summaries_dir,
             book_name,
             summary,
             kind="final",
             page_number=limit,
+            page_count=page_count,
+            first_page=first_read,
+            written_by=summarizer.label(),
         )
         add_usage(state["usage"], summary_usage)
         state["final_summary_page"] = limit
         save_state(state_path, state)
+        if path:
+            print(colored(f"✨ Final summary saved to: {path}", "green"))
+    elif not state["knowledge"] and state["last_completed_page"] == limit and limit > 0:
+        print(colored("\n⚠️  Skipping final summary: no knowledge points collected yet", "yellow"))
     return state
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract page-sourced knowledge from a PDF and build bounded summaries."
+        description=(
+            "An AI reads your PDF one page at a time, takes page-tagged notes, writes what it "
+            "understands so far every few pages, and pulls the whole book together at the end."
+        ),
+        epilog=(
+            "examples:\n"
+            "  python read_books.py                                  # meditations.pdf on the OpenAI API\n"
+            "  python read_books.py mybook.pdf --backend claude      # on your Claude plan\n"
+            "  python read_books.py mybook.pdf --backend codex       # on your ChatGPT plan\n"
+            "  python read_books.py mybook.pdf --backend grok        # on your Grok plan\n"
+            "  python read_books.py --start-page 31 --test-pages 3   # a quick 3-page taste"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pdf", type=Path, help="PDF file to process")
-    parser.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR)
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="page extraction model")
-    parser.add_argument("--analysis-model", default=DEFAULT_ANALYSIS_MODEL)
-    parser.add_argument("--interval", type=int, default=None, help="interval summary pages")
-    parser.add_argument("--test-pages", type=int, default=None, help="maximum pages to process")
-    parser.add_argument("--context-window", type=int, default=8, help="recent knowledge items")
-    parser.add_argument("--summary-chunk-size", type=int, default=20)
-    parser.add_argument("--summary-max-item-chars", type=int, default=8_000)
-    parser.add_argument("--ocr", choices=("off", "auto", "always"), default="off")
-    parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--backoff", type=float, default=1.0)
-    parser.add_argument("--reset", action="store_true", help="explicitly delete this output set")
-    resume_group = parser.add_mutually_exclusive_group()
-    resume_group.add_argument("--resume", dest="resume", action="store_true", default=True)
+    parser.add_argument("pdf", type=Path, nargs="?", default=DEFAULT_PDF,
+                        help=f"PDF file to read (default: {DEFAULT_PDF})")
+    reading = parser.add_argument_group("who reads")
+    reading.add_argument("--backend", choices=tuple(BACKENDS), default="api",
+                         help="api = OpenAI API key; claude, codex, grok = the CLI and plan you already have "
+                              "(default: api)")
+    reading.add_argument("--model", default=None,
+                         help=f"page reading model (default: {API_PAGE_MODEL} on api, the CLI's own default otherwise)")
+    reading.add_argument("--summary-backend", choices=tuple(BACKENDS), default=None,
+                         help="who writes the summaries (default: same as --backend)")
+    reading.add_argument("--summary-model", "--analysis-model", dest="summary_model", default=None,
+                         help=f"summary model (default: {API_SUMMARY_MODEL} on api, else the --model or CLI default)")
+    reading.add_argument("--effort", default=None,
+                         help="reasoning effort passed to the model, e.g. low, medium, high (default: the model's own)")
+    reading.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds allowed per model call")
+    pages = parser.add_argument_group("what to read")
+    pages.add_argument("--start-page", type=int, default=1, help="first page to read, e.g. to skip front matter")
+    pages.add_argument("--test-pages", type=int, default=None,
+                       help="read at most N pages from the start page (default: the whole book)")
+    pages.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+                       help=f"write 'what I understand so far' every N pages; 0 = never (default: {DEFAULT_INTERVAL})")
+    pages.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW,
+                       help=f"recent notes the reader sees with each page (default: {DEFAULT_CONTEXT_WINDOW})")
+    pages.add_argument("--ocr", choices=("off", "auto", "always"), default="off",
+                       help="OCR scanned pages with Tesseract (default: off)")
+    output = parser.add_argument_group("output and recovery")
+    output.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR)
+    output.add_argument("--summary-chunk-size", type=int, default=SUMMARY_CHUNK_SIZE,
+                        help="most notes in one summary request")
+    output.add_argument("--summary-max-item-chars", type=int, default=SUMMARY_MAX_ITEM_CHARS)
+    output.add_argument("--max-retries", type=int, default=3)
+    output.add_argument("--backoff", type=float, default=1.0)
+    output.add_argument("--reset", action="store_true", help="delete this book's saved notes and summaries first")
+    resume_group = output.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", dest="resume", action="store_true", default=True,
+                              help="carry on from the last page read (default)")
     resume_group.add_argument("--no-resume", dest="resume", action="store_false")
     return parser
 
@@ -498,8 +847,10 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.test_pages is not None and args.test_pages <= 0:
         parser.error("--test-pages must be > 0")
-    if args.interval is not None and args.interval <= 0:
-        parser.error("--interval must be > 0")
+    if args.start_page < 1:
+        parser.error("--start-page must be >= 1")
+    if args.interval < 0:
+        parser.error("--interval must be >= 0")
     if args.context_window < 0:
         parser.error("--context-window must be >= 0")
     if args.summary_chunk_size < 2:
@@ -508,30 +859,75 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--summary-max-item-chars must be >= 100")
     if args.max_retries < 0:
         parser.error("--max-retries must be >= 0")
+    if args.timeout <= 0:
+        parser.error("--timeout must be > 0")
+
+
+def make_backends(args: argparse.Namespace) -> tuple[Backend, Backend]:
+    reader = make_backend(args.backend, args.model, args.effort, args.timeout)
+    summary_name = args.summary_backend or args.backend
+    summary_model = args.summary_model
+    if summary_model is None:
+        summary_model = API_SUMMARY_MODEL if summary_name == "api" else (
+            args.model if summary_name == args.backend else None
+        )
+    summarizer = make_backend(summary_name, summary_model, args.effort, args.timeout)
+    return reader, summarizer
+
+
+def print_banner(book: Path, page_count: int, reader: Backend, summarizer: Backend, args: argparse.Namespace) -> None:
+    last = page_count if args.test_pages is None else min(page_count, args.start_page - 1 + args.test_pages)
+    every = f"every {args.interval} pages" if args.interval else "off"
+    span = f"page {last}" if last == args.start_page else f"pages {args.start_page}–{last}"
+    print(colored(f"""
+📚 AI reads books, page by page 📚
+---------------------------------
+   Book:          {book.name} ({page_count} pages)
+   Reading:       {span}, one page per model call
+   Reader:        {reader.label()}
+   Summaries:     {summarizer.label()}
+   Understanding: {every}
+   Output:        {args.base_dir}/
+""", "cyan"))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(parser, args)
-    pdf_path = setup_directories(args.pdf, args.base_dir, reset=args.reset)
+    try:
+        reader, summarizer = make_backends(args)
+        reader.check()
+        summarizer.check()
+    except SetupError as exc:
+        print(colored(f"🔑 {exc}", "red"))
+        return 2
+    try:
+        pdf_path = setup_directories(args.pdf, args.base_dir, reset=args.reset)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(colored(f"❌ {exc}", "red"))
+        return 2
+    import pymupdf  # PyMuPDF (the old `fitz` name can clash with an unrelated package)
+
     stem = args.pdf.stem
     state_path = args.base_dir / "knowledge_bases" / f"{stem}_knowledge.json"
     summaries_dir = args.base_dir / "summaries"
-    client = OpenAI()
-    document = fitz.open(pdf_path)
+    document = pymupdf.open(pdf_path)
+    print_banner(args.pdf, document.page_count, reader, summarizer, args)
+    started = time.monotonic()
     try:
         state = run_analysis(
             document,
-            client,
+            reader,
             state_path,
             summaries_dir,
+            summary_backend=summarizer,
+            book_name=args.pdf.name,
             max_pages=args.test_pages,
+            start_page=args.start_page,
             resume=args.resume and not args.reset,
             context_window=args.context_window,
-            interval=args.interval,
-            model=args.model,
-            analysis_model=args.analysis_model,
+            interval=args.interval or None,
             summary_chunk_size=args.summary_chunk_size,
             summary_max_item_chars=args.summary_max_item_chars,
             ocr=args.ocr,
@@ -540,18 +936,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             backoff=args.backoff,
             document_id=file_digest(pdf_path),
         )
+    except KeyboardInterrupt:
+        print(colored(f"\n⏸️  Paused. {_progress_note(state_path)} Run the same command again to carry on.", "yellow"))
+        return 130
+    except UsageLimitError as exc:
+        print(colored(f"\n⏸️  {exc}\n   {_progress_note(state_path)} Run the same command again later to carry on.",
+                      "yellow"))
+        return 75
+    except SetupError as exc:
+        print(colored(f"\n🔑 {exc}\n   {_progress_note(state_path)}", "red"))
+        return 2
+    except BackendError as exc:
+        print(colored(f"\n❌ {exc}\n   {_progress_note(state_path)} Run the same command again to retry.", "red"))
+        return 1
     finally:
         document.close()
-    usage = state.get("usage", {})
-    print(
-        colored(
-            f"✨ Complete through page {state['last_completed_page']}; "
-            f"knowledge={len(state['knowledge'])}; usage={json.dumps(usage)}",
-            "green",
-        )
-    )
+    elapsed = time.monotonic() - started
+    timed = [entry["seconds"] for entry in state["reading_log"] if entry.get("seconds")]
+    per_page = sum(timed) / len(timed) if timed else 0
+    usage = {name: value for name, value in state.get("usage", {}).items() if value}
+    print(colored(
+        f"\n✨ Processing complete! ✨ Read through page {state['last_completed_page']}, "
+        f"{len(state['knowledge'])} knowledge points.",
+        "green", attrs=["bold"],
+    ))
+    if per_page:
+        print(colored(f"   ⏱️  {per_page:.1f} s per page read on average; this run took {elapsed:.0f} s", "green"))
+    if usage:
+        print(colored(f"   🧮 Tokens so far: {json.dumps(usage)}", "green"))
     return 0
 
 
+def _progress_note(state_path: Path) -> str:
+    try:
+        page = load_state(state_path)["last_completed_page"]
+    except (OSError, ValueError):
+        return "Nothing was lost."
+    return f"Progress is saved through page {page}." if page else "No pages were finished yet."
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
