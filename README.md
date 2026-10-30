@@ -52,8 +52,8 @@ Stop it any time with Ctrl+C. Every finished page is saved, and running the same
 
 Being straight with you about what was run for real:
 
-- **Run on real pages** (3 pages of `meditations.pdf`, with a look back and a final summary): the **Codex** and **Grok Build** CLIs.
-- **Checked against each provider's official docs, but not yet run live**: the **OpenAI**, **Anthropic**, **xAI** and **OpenRouter** APIs, and the **Claude Code** CLI. Each one has offline tests that run the real SDK and check the exact request the provider would receive and how its answers and errors are handled. The doc pages each backend follows are linked in [`backends.py`](backends.py).
+- **Run on real pages** (3 pages of `meditations.pdf`, with a look back and a final summary): the **Claude Code**, **Codex** and **Grok Build** CLIs.
+- **Checked against each provider's official docs, but not yet run live**: the **OpenAI**, **Anthropic**, **xAI** and **OpenRouter** APIs. Each one has offline tests that run the real SDK and check the exact request the provider would receive and how its answers and errors are handled. The doc pages each backend follows are linked in [`backends.py`](backends.py).
 
 If you run one of the untested ones, an issue saying how it went would help everyone.
 
@@ -178,7 +178,7 @@ Codex and Claude runs are not saved anywhere. Grok Build has no such option yet,
 
 ## ⚖️ Honest trade-offs
 
-- **A CLI is slower than an API.** Every page starts a fresh CLI run, and that startup time comes on top of the model's own thinking. In our 3 page test with each CLI's default model, a page took about 13 seconds on Codex and about 19 seconds on Grok. So a 250 page book is roughly an hour or more of reading, plus the summaries. You can leave it running, and Ctrl+C never loses a finished page.
+- **A CLI is slower than an API.** Every page starts a fresh CLI run, and that startup time comes on top of the model's own thinking. In our 3 page test with each CLI's default model, a page took about 10 seconds on Claude Code, about 13 seconds on Codex and about 19 seconds on Grok. So a 250 page book is roughly an hour or more of reading, plus the summaries. You can leave it running, and Ctrl+C never loses a finished page.
 - **An API key is billed per use.** A book is one call per page plus a few summaries, so a 250 page book is a few hundred calls. Try `--test-pages 3` first to see what a page costs you.
 - **Limits can stop a long book.** When your plan hits its usage limit or your API account runs out of credit, the reader stops, keeps every page so far, and tells you. Run the same command later and it carries on.
 - **Your book's text goes to the provider you choose** (OpenAI, Anthropic, xAI, or OpenRouter and the provider it routes to), under your account's terms. Only send books you are happy to share with them.
