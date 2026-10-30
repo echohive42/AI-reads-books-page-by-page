@@ -344,7 +344,7 @@ def test_smaller_max_pages_never_regresses_or_relabels_completed_state(tmp_path)
 def test_resume_rejects_a_different_document(tmp_path):
     run(FakeDocument(["one"]), FakeBackend(), tmp_path, document_id="first")
 
-    with pytest.raises(RuntimeError, match="different PDF"):
+    with pytest.raises(RuntimeError, match="different file"):
         run(FakeDocument(["replacement"]), FakeBackend(), tmp_path, document_id="second")
 
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """AI reads books page by page.
 
-The AI reads a PDF the way a person studies a book: one page at a time. With each page
+The AI reads a book the way a person studies it: one page at a time. A PDF keeps its own
+pages; an EPUB, Word, Markdown or text file is cut into book-size pages. With each page
 it sees only that page, the last lines of the page before, and its own notes so far.
 It writes down what it learned (every note tagged with its page), and every few pages
 it writes down what it understands so far. At the end it pulls the whole book together.
@@ -28,6 +29,7 @@ from typing import Any, Callable, Sequence
 from pydantic import BaseModel, ValidationError
 from termcolor import colored
 
+from books import PAGE_CHARS, UnsupportedBook, book_format, is_pdf, open_book
 from backends import (
     BACKENDS,
     DEFAULT_TIMEOUT,
@@ -51,6 +53,10 @@ UNDERSTANDING_CHARS = 6_000   # how much of the running understanding goes along
 SUMMARY_CHUNK_SIZE = 300      # most notes in one summary request
 SUMMARY_CHUNK_CHARS = 100_000  # most characters of notes in one summary request
 SUMMARY_MAX_ITEM_CHARS = 8_000
+
+
+class CannotResume(RuntimeError):
+    """The saved progress doesn't match this book, so carrying on would mix up its pages."""
 
 
 class PageContent(BaseModel):
@@ -178,6 +184,7 @@ def empty_state() -> dict[str, Any]:
     return {
         "version": 2,
         "document_id": None,
+        "page_layout": None,
         "last_completed_page": 0,
         "knowledge": [],
         "reading_log": [],
@@ -222,13 +229,13 @@ def setup_directories(
     """Create output directories; preserve existing output unless reset is explicit."""
     source_pdf = Path(source_pdf)
     base_dir = Path(base_dir)
-    pdf_dir = base_dir / "pdfs"
+    pdf_dir = base_dir / ("pdfs" if is_pdf(source_pdf) else "books")
     knowledge_dir = base_dir / "knowledge_bases"
     summaries_dir = base_dir / "summaries"
     for directory in (pdf_dir, knowledge_dir, summaries_dir):
         directory.mkdir(parents=True, exist_ok=True)
     if not source_pdf.exists():
-        raise FileNotFoundError(f"PDF file not found: {source_pdf}")
+        raise FileNotFoundError(f"File not found: {source_pdf}")
     destination = pdf_dir / source_pdf.name
     if reset:
         selected_outputs = [knowledge_dir / f"{source_pdf.stem}_knowledge.json"]
@@ -249,11 +256,11 @@ def setup_directories(
     if source_pdf.resolve() != destination.resolve():
         if destination.exists() and file_digest(source_pdf) != file_digest(destination):
             raise RuntimeError(
-                f"PDF changed for existing output set: {source_pdf.name}; rerun with --reset"
+                f"{source_pdf.name} changed since it was last read; rerun with --reset"
             )
         if not destination.exists():
             shutil.copy2(source_pdf, destination)
-            print(colored(f"📄 Copied PDF to: {destination}", "green"))
+            print(colored(f"📄 Copied the book to: {destination}", "green"))
     return destination
 
 
@@ -553,6 +560,7 @@ def save_summary(
     page_count: int | None = None,
     first_page: int = 1,
     written_by: str | None = None,
+    page_note: str = "",
 ) -> Path | None:
     if not summary:
         return None
@@ -567,7 +575,7 @@ def save_summary(
     content = (
         f"# Book Analysis: {book_name}\n{title}\n\n"
         f"Generated: {datetime.now().isoformat(timespec='seconds')}{by}  \n"
-        f"Processed through page: {page_number}\n\n{summary}\n\n"
+        f"Processed through page: {page_number}{page_note}\n\n{summary}\n\n"
         "---\n*Read page by page with [AI reads books](https://github.com/echohive42/AI-reads-books-page-by-page)*\n"
     )
     path.write_text(content, encoding="utf-8")
@@ -612,6 +620,7 @@ def run_analysis(
     max_retries: int = 3,
     backoff: float = 1.0,
     document_id: str | None = None,
+    page_layout: dict[str, Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     if context_window < 0:
@@ -627,9 +636,19 @@ def run_analysis(
         # a later default resume must not see stale progress from an older run.
         save_state(state_path, state)
     if resume and document_id and state.get("document_id") not in (None, document_id):
-        raise RuntimeError("Cannot resume: state belongs to a different PDF; use --reset")
+        raise CannotResume("Cannot resume: the saved notes belong to a different file; use --reset")
+    if resume and page_layout and state.get("page_layout") not in (None, page_layout):
+        raise CannotResume(
+            "Cannot resume: this book was cut into pages differently last time, so its page numbers "
+            "would shift. Run it with --reset to read it again from the start."
+        )
     if document_id:
         state["document_id"] = document_id
+    if page_layout:
+        state["page_layout"] = page_layout
+    reader_pages = bool(page_layout and page_layout.get("page_chars"))
+    page_note = (f"  \nPages are reader pages of about {page_layout['page_chars']:,} characters, "
+                 "not the printed edition's." if reader_pages else "")
     book_name = book_name or state_path.name.removesuffix("_knowledge.json") + ".pdf"
     page_count = document.page_count
     limit = page_count if max_pages is None else min(page_count, start_page - 1 + max_pages)
@@ -665,6 +684,7 @@ def run_analysis(
                 page_number=page_number,
                 page_count=page_count,
                 written_by=summarizer.label(),
+                page_note=page_note,
             )
             if summary:
                 state["understanding"] = {"page": page_number, "text": summary}
@@ -775,6 +795,7 @@ def run_analysis(
             page_count=page_count,
             first_page=first_read,
             written_by=summarizer.label(),
+            page_note=page_note,
         )
         add_usage(state["usage"], summary_usage)
         state["final_summary_page"] = limit
@@ -789,13 +810,13 @@ def run_analysis(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "An AI reads your PDF one page at a time, takes page-tagged notes, writes what it "
+            "An AI reads your book one page at a time, takes page-tagged notes, writes what it "
             "understands so far every few pages, and pulls the whole book together at the end."
         ),
         epilog=(
             "examples:\n"
             "  python read_books.py                                  # meditations.pdf on the OpenAI API\n"
-            "  python read_books.py mybook.pdf --backend claude      # on your Claude plan\n"
+            "  python read_books.py mybook.epub --backend claude     # on your Claude plan (also .docx, .md, .txt)\n"
             "  python read_books.py mybook.pdf --backend codex       # on your ChatGPT plan\n"
             "  python read_books.py mybook.pdf --backend grok        # on your Grok plan\n"
             "  python read_books.py mybook.pdf --backend anthropic   # with ANTHROPIC_API_KEY (also: gemini, xai, openrouter)\n"
@@ -803,8 +824,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("pdf", type=Path, nargs="?", default=DEFAULT_PDF,
-                        help=f"PDF file to read (default: {DEFAULT_PDF})")
+    parser.add_argument("pdf", metavar="book", type=Path, nargs="?", default=DEFAULT_PDF,
+                        help=f"the book to read: PDF, EPUB, Word (.docx), Markdown or text (default: {DEFAULT_PDF})")
     reading = parser.add_argument_group("who reads")
     reading.add_argument("--backend", choices=tuple(BACKENDS), default="openai",
                          help="openai, anthropic, gemini, xai, openrouter = an API key; claude, codex, grok = the CLI "
@@ -830,7 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
     pages.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW,
                        help=f"recent notes the reader sees with each page (default: {DEFAULT_CONTEXT_WINDOW})")
     pages.add_argument("--ocr", choices=("off", "auto", "always"), default="off",
-                       help="OCR scanned pages with Tesseract (default: off)")
+                       help="OCR scanned PDF pages with Tesseract (default: off)")
     output = parser.add_argument_group("output and recovery")
     output.add_argument("--base-dir", type=Path, default=DEFAULT_BASE_DIR)
     output.add_argument("--summary-chunk-size", type=int, default=SUMMARY_CHUNK_SIZE,
@@ -865,6 +886,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--timeout must be > 0")
     if args.base_url and "openai" not in (args.backend, args.summary_backend):
         parser.error("--base-url only works with --backend openai (or --summary-backend openai)")
+    if args.ocr != "off" and not is_pdf(args.pdf):
+        parser.error("--ocr is for scanned PDFs; other formats are read as text")
 
 
 def make_backends(args: argparse.Namespace) -> tuple[Backend, Backend]:
@@ -880,12 +903,13 @@ def make_backends(args: argparse.Namespace) -> tuple[Backend, Backend]:
 
 def print_banner(book: Path, page_count: int, reader: Backend, summarizer: Backend, args: argparse.Namespace) -> None:
     last = page_count if args.test_pages is None else min(page_count, args.start_page - 1 + args.test_pages)
+    pages = "pages" if is_pdf(book) else f"reader pages of about {PAGE_CHARS:,} characters"
     every = f"every {args.interval} pages" if args.interval else "off"
     span = f"page {last}" if last == args.start_page else f"pages {args.start_page}–{last}"
     print(colored(f"""
 📚 AI reads books, page by page 📚
 ---------------------------------
-   Book:          {book.name} ({page_count} pages)
+   Book:          {book.name} ({page_count} {pages})
    Reading:       {span}, one page per model call
    Reader:        {reader.label()}
    Summaries:     {summarizer.label()}
@@ -899,6 +923,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     validate_args(parser, args)
     try:
+        book_format(args.pdf)
+    except UnsupportedBook as exc:
+        print(colored(f"📕 {exc}", "red"))
+        return 2
+    try:
         reader, summarizer = make_backends(args)
         reader.check()
         summarizer.check()
@@ -910,12 +939,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (FileNotFoundError, RuntimeError) as exc:
         print(colored(f"❌ {exc}", "red"))
         return 2
-    import pymupdf  # PyMuPDF (the old `fitz` name can clash with an unrelated package)
-
     stem = args.pdf.stem
     state_path = args.base_dir / "knowledge_bases" / f"{stem}_knowledge.json"
     summaries_dir = args.base_dir / "summaries"
-    document = pymupdf.open(pdf_path)
+    try:
+        document, page_layout = open_book(pdf_path)
+    except UnsupportedBook as exc:
+        print(colored(f"📕 {exc}", "red"))
+        return 2
+    if not document.page_count:
+        document.close()
+        print(colored(f"📕 No text found in {args.pdf.name}.", "red"))
+        return 2
     print_banner(args.pdf, document.page_count, reader, summarizer, args)
     started = time.monotonic()
     try:
@@ -938,6 +973,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_retries=args.max_retries,
             backoff=args.backoff,
             document_id=file_digest(pdf_path),
+            page_layout=page_layout,
         )
     except KeyboardInterrupt:
         print(colored(f"\n⏸️  Paused. {_progress_note(state_path)} Run the same command again to carry on.", "yellow"))
@@ -952,6 +988,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BackendError as exc:
         print(colored(f"\n❌ {exc}\n   {_progress_note(state_path)} Run the same command again to retry.", "red"))
         return 1
+    except CannotResume as exc:
+        print(colored(f"\n❌ {exc}", "red"))
+        return 2
     finally:
         document.close()
     elapsed = time.monotonic() - started

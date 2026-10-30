@@ -1,6 +1,6 @@
 # 📚 AI reads books, page by page
 
-Give it a PDF, and an AI reads it the way you would study a book: one page at a time.
+Give it a book, and an AI reads it the way you would study one: one page at a time. PDF, EPUB, Word, Markdown and plain text all work.
 
 On every page it writes down what it learned, each note tagged with its page number. Every 20 pages it stops and writes down **what it understands so far**. When it reaches the last page, it pulls the whole book together into one final summary. You watch it happen live in your terminal, page by page.
 
@@ -17,7 +17,7 @@ On every page it writes down what it learned, each note tagged with its page num
 | An xAI API key | `--backend xai` | `export XAI_API_KEY=...` |
 | An OpenRouter key | `--backend openrouter` | `export OPENROUTER_API_KEY=...` |
 
-A plan needs no API key: the reader uses the coding CLI that comes with it. Whichever you pick, it still reads one page per call, and the model only ever sees the page in front of it plus the reader's own notes. It never gets the PDF file, a shell, or any tools (see [What the AI can see](#-what-the-ai-can-see)).
+A plan needs no API key: the reader uses the coding CLI that comes with it. Whichever you pick, it still reads one page per call, and the model only ever sees the page in front of it plus the reader's own notes. It never gets the book file, a shell, or any tools (see [What the AI can see](#-what-the-ai-can-see)).
 
 ## 🚀 Quick start
 
@@ -48,13 +48,33 @@ When you are ready for a whole book:
 python read_books.py path/to/your_book.pdf --backend codex
 ```
 
-Stop it any time with Ctrl+C. Every finished page is saved, and running the same command again carries on from where it stopped.
+An `.epub`, `.docx`, `.md` or `.txt` file works the same way (see [What it can read](#-what-it-can-read)). Stop it any time with Ctrl+C. Every finished page is saved, and running the same command again carries on from where it stopped.
+
+## 📖 What it can read
+
+| File | How it is read | Its pages |
+|---|---|---|
+| PDF (`.pdf`) | With PyMuPDF; add `--ocr auto` for scanned pages | The PDF's own pages |
+| EPUB (`.epub`) | The chapters in reading order, straight from the file | Reader pages |
+| Word (`.docx`) | The document's paragraphs | Reader pages |
+| Markdown (`.md`) and text (`.txt`) | As written | Reader pages |
+
+EPUB, Word, Markdown and text are read directly with Python's standard library: no conversion to PDF, and nothing extra to install.
+
+**Reader pages.** These formats have no fixed pages, because their text reflows to fit the screen. So the reader cuts them into pages of about 2,400 characters (roughly one printed page), always at a paragraph break, or at the end of a sentence inside a very long paragraph. The page numbers in the notes and summaries count these reader pages, not the pages of a printed edition. The same file always gives the same pages, so stopping and carrying on is safe.
+
+Not read directly:
+
+- **Kindle files** (`.mobi`, `.azw`, `.azw3`): convert the book to EPUB first, for example with the free [Calibre](https://calibre-ebook.com) app, then read the `.epub`.
+- **Old Word files** (`.doc`): open it in Word or Pages and save it as `.docx`.
+- **Books with DRM**: only DRM-free books can be read or converted.
 
 ## ✅ What has been tested
 
 Being straight with you about what was run for real:
 
 - **Run on real pages** (3 pages of `meditations.pdf`, with a look back and a final summary): the **Claude Code**, **Codex** and **Grok Build** CLIs.
+- **EPUB, run on real pages** (2 reader pages of a small EPUB made from the first chapter of the Meditations, with a final summary): Claude Code. Word, Markdown and text files go through the same page cutting and have offline tests, but no live run yet.
 - **Checked against each provider's official docs, but not yet run live**: the **OpenAI**, **Anthropic**, **Gemini**, **xAI** and **OpenRouter** APIs. Each one has offline tests that run the real SDK and check the exact request the provider would receive and how its answers and errors are handled. The doc pages each backend follows are linked in [`backends.py`](backends.py). For Gemini, its real answers to a wrong key, an unknown model and an account with no credit were checked live; no page has been read with it yet.
 
 If you run one of the untested ones, an issue saying how it went would help everyone.
@@ -65,7 +85,7 @@ The idea is simple: read like a person, not like a search engine. Nobody underst
 
 **Every page is its own model call.** For page N, the reader sends:
 
-1. 📄 the text of page N (pulled out with PyMuPDF),
+1. 📄 the text of page N (pulled out with PyMuPDF for a PDF),
 2. ✂️ the last lines of page N-1, so a sentence that runs over the page break still makes sense,
 3. 📝 its most recent notes, each tagged with the page it came from,
 4. 💭 one-line memories of the last few pages,
@@ -114,7 +134,7 @@ For `your_book.pdf`:
 
 ```text
 book_analysis/
-├── pdfs/your_book.pdf                      # a copy of the book
+├── pdfs/your_book.pdf                      # a copy of the book (other formats go in books/)
 ├── knowledge_bases/your_book_knowledge.json  # every note with its page, gists, progress
 └── summaries/
     ├── your_book_interval_00020.md         # what it understood after page 20
@@ -122,7 +142,7 @@ book_analysis/
     └── your_book_final.md                  # the whole book, pulled together
 ```
 
-The knowledge base is saved safely after every page, together with the PDF's fingerprint. If you change the PDF but keep its name, the reader stops instead of mixing two books; use `--reset` to start that book over. `--reset` only touches that one book's files.
+The knowledge base is saved safely after every page, together with the book file's fingerprint and how it was cut into pages. If you change the book but keep its name, the reader stops instead of mixing two books; use `--reset` to start that book over. `--reset` only touches that one book's files.
 
 ## ⚙️ Options
 
@@ -130,7 +150,7 @@ Run `python read_books.py --help` for all of them. The ones you will use most:
 
 | Option | What it does |
 |---|---|
-| `pdf` | The book to read (default: `meditations.pdf`) |
+| `book` | The book to read: PDF, EPUB, Word, Markdown or text (default: `meditations.pdf`) |
 | `--backend NAME` | Who reads it: `openai` (default), `anthropic`, `gemini`, `xai`, `openrouter`, `claude`, `codex` or `grok` |
 | `--model NAME` | The model for pages and summaries (defaults below) |
 | `--summary-backend`, `--summary-model` | Let a different backend or model write the summaries |
@@ -139,7 +159,7 @@ Run `python read_books.py --help` for all of them. The ones you will use most:
 | `--test-pages N` | Read only N pages, to try things out |
 | `--interval N` | Look back every N pages (default: 20; 0 turns it off) |
 | `--context-window N` | How many recent notes travel with each page (default: 8) |
-| `--ocr auto` | Read scanned pages with Tesseract (`brew install tesseract` on a Mac) |
+| `--ocr auto` | Read scanned PDF pages with Tesseract (`brew install tesseract` on a Mac) |
 | `--reset` | Forget this book's notes and summaries and start over |
 | `--timeout SECONDS` | How long one model call may take (default: 600) |
 | `--base-url URL` | Send `--backend openai` requests to another OpenAI-compatible endpoint |
@@ -187,6 +207,7 @@ Codex and Claude runs are not saved anywhere. Grok Build has no such option yet,
 - **Your book's text goes to the provider you choose** (OpenAI, Anthropic, Google, xAI, or OpenRouter and the provider it routes to), under your account's terms. Only send books you are happy to share with them.
 - **Summaries are AI writing.** They can miss or bend things. Every note keeps its page number, so you can check it against the book.
 - **PDF text is not always clean.** Multi-column or heavily designed pages can come out in the wrong order, and scanned pages need `--ocr auto`.
+- **Reader pages are not printed pages.** For EPUB, Word, Markdown and text, a note's page number counts reader pages, so it won't match a printed edition of the book.
 
 ## 🧪 Running the tests
 
@@ -199,7 +220,7 @@ The tests use fake backends, a stand-in CLI, and the real OpenAI and Anthropic S
 
 ## 🙏 Thanks
 
-Thanks to [xdlkc](https://github.com/xdlkc) for the pull request that made reading resumable: safe saving after every page, page-tagged notes, bounded summaries, OCR and the first test suite. This version builds on it.
+Thanks to [xdlkc](https://github.com/xdlkc) for the pull request that made reading resumable: safe saving after every page, page-tagged notes, bounded summaries, OCR and the first test suite. This version builds on it. Thanks to [TomLucidor](https://github.com/TomLucidor) for the idea of reading EPUB and other lighter formats directly.
 
 ## 📜 License
 
