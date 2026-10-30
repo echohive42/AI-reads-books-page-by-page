@@ -150,7 +150,11 @@ def split_into_pages(text: str, size: int = PAGE_CHARS) -> list[str]:
 
 def plain_text(path: Path) -> str:
     """Markdown and text are read exactly as written, headings and links included."""
-    return path.read_text(encoding="utf-8-sig", errors="replace")
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:  # older Windows and Project Gutenberg files
+        return data.decode("cp1252", errors="replace")
 
 
 _BLOCK_TAGS = {
@@ -201,14 +205,11 @@ def epub_text(path: Path) -> str:
     """The chapters of an EPUB in reading order (its spine), as plain text."""
     with zipfile.ZipFile(path) as book:
         names = set(book.namelist())
+        encrypted = set()
         if "META-INF/encryption.xml" in names:
-            encrypted = ElementTree.fromstring(book.read("META-INF/encryption.xml"))
-            # Font obfuscation is harmless; encrypted chapters mean DRM.
-            if any(_local(element.tag) == "CipherReference"
-                   and re.search(r"\.x?html?$", element.get("URI", ""), re.IGNORECASE)
-                   for element in encrypted.iter()):
-                raise UnsupportedBook(f"{path.name} is DRM-protected, so it can't be read. "
-                                      "Only DRM-free EPUBs work.")
+            encryption = ElementTree.fromstring(book.read("META-INF/encryption.xml"))
+            encrypted = {unquote(element.get("URI", "")) for element in encryption.iter()
+                         if _local(element.tag) == "CipherReference"}
         container = ElementTree.fromstring(book.read("META-INF/container.xml"))
         opf_path = next(element.get("full-path") for element in container.iter()
                         if _local(element.tag) == "rootfile" and element.get("full-path"))
@@ -228,6 +229,9 @@ def epub_text(path: Path) -> str:
             name = posixpath.normpath(posixpath.join(base, unquote(item.get("href", "").split("#")[0])))
             if name not in names:
                 continue
+            if name in encrypted:  # encrypted fonts are harmless; an encrypted chapter means DRM
+                raise UnsupportedBook(f"{path.name} is DRM-protected, so it can't be read. "
+                                      "Use a DRM-free copy.")
             parser = _HTMLText()
             parser.feed(book.read(name).decode("utf-8", errors="replace"))
             parser.close()

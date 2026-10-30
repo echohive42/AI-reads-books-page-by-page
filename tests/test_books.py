@@ -115,6 +115,18 @@ def test_a_drm_protected_epub_says_so(tmp_path):
         open_book(epub)
 
 
+def test_an_epub_with_only_its_fonts_obfuscated_still_reads(tmp_path):
+    epub = tmp_path / "fonts.epub"
+    make_epub(epub, {"a.xhtml": "<p>Open text.</p>"}, spine=["a.xhtml"], encryption="""<?xml version="1.0"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData><enc:CipherData><enc:CipherReference URI="OEBPS/fonts/serif.otf"/></enc:CipherData></enc:EncryptedData>
+</encryption>""")
+
+    document, _layout = open_book(epub)
+
+    assert document[0].get_text() == "Open text."
+
+
 def test_a_damaged_epub_gets_a_clear_message(tmp_path):
     epub = tmp_path / "broken.epub"
     epub.write_bytes(b"not a zip file")
@@ -142,6 +154,15 @@ def test_markdown_and_text_are_read_as_written(tmp_path):
     assert layout["format"] == "markdown" and document.page_count == 1
     assert document[0].get_text() == "# Heading\n\nSome *text* and a [link](https://example.com)."
     assert book_format(Path("story.txt")) == "text" and book_format(Path("Book.PDF")) == "pdf"
+
+
+def test_an_old_windows_text_file_still_reads(tmp_path):
+    text = tmp_path / "old.txt"
+    text.write_bytes("Caf\u00e9 \u201cquotes\u201d \u2013 done.".encode("cp1252"))
+
+    document, _layout = open_book(text)
+
+    assert document[0].get_text() == "Caf\u00e9 \u201cquotes\u201d \u2013 done."
 
 
 @pytest.mark.parametrize("name, message", [
@@ -198,6 +219,18 @@ def test_main_turns_away_a_mobi_before_making_any_folders(tmp_path, capsys):
     assert read_books.main([str(mobi), "--base-dir", str(tmp_path / "out")]) == 2
     assert "Calibre" in capsys.readouterr().out
     assert not (tmp_path / "out").exists()
+
+
+def test_a_book_with_no_text_stops_with_a_hint(tmp_path, monkeypatch, capsys):
+    epub = tmp_path / "comic.epub"
+    make_epub(epub, {"a.xhtml": '<p><img src="page1.jpg" alt=""/></p>'}, spine=["a.xhtml"])
+    reader = FakeBackend()
+    monkeypatch.setattr(read_books, "make_backends", lambda _args: (reader, reader))
+
+    assert read_books.main([str(epub), "--base-dir", str(tmp_path / "out")]) == 2
+    out = capsys.readouterr().out
+    assert "No text found in comic.epub" in out and "--ocr auto" in out
+    assert reader.calls == []
 
 
 def test_ocr_is_only_for_pdfs(tmp_path):

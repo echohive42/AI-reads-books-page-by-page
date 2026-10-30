@@ -949,7 +949,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if not document.page_count:
         document.close()
-        print(colored(f"📕 No text found in {args.pdf.name}.", "red"))
+        print(colored(f"📕 No text found in {args.pdf.name}. If it's scanned or made of images, "
+                      "save it as a PDF and read that with --ocr auto.", "red"))
         return 2
     print_banner(args.pdf, document.page_count, reader, summarizer, args)
     started = time.monotonic()
