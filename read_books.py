@@ -798,7 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python read_books.py mybook.pdf --backend claude      # on your Claude plan\n"
             "  python read_books.py mybook.pdf --backend codex       # on your ChatGPT plan\n"
             "  python read_books.py mybook.pdf --backend grok        # on your Grok plan\n"
-            "  python read_books.py mybook.pdf --backend anthropic   # with ANTHROPIC_API_KEY (also: xai, openrouter)\n"
+            "  python read_books.py mybook.pdf --backend anthropic   # with ANTHROPIC_API_KEY (also: gemini, xai, openrouter)\n"
             "  python read_books.py --start-page 31 --test-pages 3   # a quick 3-page taste"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -807,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"PDF file to read (default: {DEFAULT_PDF})")
     reading = parser.add_argument_group("who reads")
     reading.add_argument("--backend", choices=tuple(BACKENDS), default="openai",
-                         help="openai, anthropic, xai, openrouter = an API key; claude, codex, grok = the CLI "
+                         help="openai, anthropic, gemini, xai, openrouter = an API key; claude, codex, grok = the CLI "
                               "and plan you already have (default: openai)")
     reading.add_argument("--model", default=None,
                          help="the model for pages and summaries (default: each backend's own; on openai "

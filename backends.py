@@ -1,5 +1,5 @@
-"""How the reader talks to a model: an API key (OpenAI, Anthropic, xAI, OpenRouter),
-or the Claude Code, Codex and Grok CLIs that come with a plan.
+"""How the reader talks to a model: an API key (OpenAI, Anthropic, Gemini, xAI,
+OpenRouter), or the Claude Code, Codex and Grok CLIs that come with a plan.
 
 Every backend does one thing: take a system prompt and a user prompt, and return
 either JSON matching a schema (a page's notes) or Markdown (a summary).
@@ -43,6 +43,10 @@ XAI_MODEL = "grok-4.7"
 # openrouter.ai/api/v1/models?supported_parameters=structured_outputs.
 OPENROUTER_PAGE_MODEL = "openai/gpt-6-luna"
 OPENROUTER_SUMMARY_MODEL = "openai/gpt-6.1-sol"
+# Google (ai.google.dev/gemini-api/docs/models): 3.8 Flash is the strongest Flash model, so it
+# reads the pages; Gemini 4 Argon, the flagship reasoning model, writes the summaries.
+GEMINI_PAGE_MODEL = "gemini-3.8-flash"
+GEMINI_SUMMARY_MODEL = "gemini-4-argon"
 # Anthropic streams every call, so a long final summary never hits a request timeout;
 # this caps one answer, thinking included.
 ANTHROPIC_MAX_TOKENS = 64000
@@ -143,7 +147,7 @@ def _usage(prompt: Any = None, completion: Any = None, total: Any = None) -> dic
 
 
 # Providers echo part of a rejected key in their error text ("sk-proj-****jCcA"); never print it.
-_KEY_LIKE = re.compile(r"\b(?:sk|xai|key)-[A-Za-z0-9_*.\-]{6,}")
+_KEY_LIKE = re.compile(r"\b(?:(?:sk|xai|key)-[A-Za-z0-9_*.\-]{6,}|AIza[A-Za-z0-9_\-]{20,})")
 
 
 def _redact(error: Exception | str) -> str:
@@ -257,6 +261,8 @@ class OpenAICompatibleBackend(Backend):
         choice = response.choices[0]
         if getattr(choice, "finish_reason", None) == "error":
             raise TransientError(f"{self.provider}: the model stopped with an error partway through")
+        if getattr(choice, "finish_reason", None) == "content_filter":
+            raise TransientError(f"{self.provider} held this answer back (a safety or recitation filter)")
         message = choice.message
         if getattr(message, "refusal", None):
             raise TransientError(f"The model refused: {message.refusal}")
@@ -292,6 +298,37 @@ class XAIBackend(OpenAICompatibleBackend):
     base_url = "https://api.x.ai/v1"
     page_model = XAI_MODEL
     summary_model = XAI_MODEL
+
+
+class GeminiBackend(OpenAICompatibleBackend):
+    """The Gemini API with GEMINI_API_KEY, through Google's OpenAI-compatible endpoint.
+
+    Google points code that already uses the openai SDK, as this reader does, at that endpoint.
+    It takes response_format json_schema, and reasoning_effort minimal, low, medium or high.
+    Docs: https://ai.google.dev/gemini-api/docs/openai
+    and https://ai.google.dev/gemini-api/docs/api-errors
+    """
+
+    name = "gemini"
+    provider = "Gemini"
+    key_env = "GEMINI_API_KEY"
+    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    page_model = GEMINI_PAGE_MODEL
+    summary_model = GEMINI_SUMMARY_MODEL
+
+    def api_error(self, exc: Exception) -> BackendError:
+        status, text = getattr(exc, "status_code", None), _redact(exc)
+        # A wrong key comes back as 400 INVALID_ARGUMENT ("Please pass a valid API key"), not 401.
+        if status in (400, 403) and re.search(r"valid API key|API key not valid|API_KEY_INVALID|leaked", text,
+                                              re.IGNORECASE):
+            return SetupError(f"Gemini rejected the key in {self.key_env}: {text}")
+        # A 429 is either a per-minute rate limit (retry) or the daily quota (stop for today), and
+        # both can say "exceeded your current quota", so only daily wording stops the reader.
+        if status == 429:
+            if re.search(r"per ?day|daily|quota_exceeded", text, re.IGNORECASE):
+                return UsageLimitError(f"The Gemini daily quota is used up: {text}")
+            return TransientError(f"Gemini API: {text}")
+        return super().api_error(exc)
 
 
 class OpenRouterBackend(OpenAICompatibleBackend):
@@ -724,6 +761,7 @@ class GrokBackend(CLIBackend):
 BACKENDS: dict[str, type[Backend]] = {
     "openai": OpenAIBackend,
     "anthropic": AnthropicBackend,
+    "gemini": GeminiBackend,
     "xai": XAIBackend,
     "openrouter": OpenRouterBackend,
     "claude": ClaudeBackend,

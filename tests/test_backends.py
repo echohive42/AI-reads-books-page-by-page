@@ -13,6 +13,7 @@ from backends import (
     BackendError,
     ClaudeBackend,
     CodexBackend,
+    GeminiBackend,
     GrokBackend,
     OpenAIBackend,
     OpenRouterBackend,
@@ -216,7 +217,7 @@ def test_a_missing_cli_is_a_clear_setup_error(monkeypatch):
 
 def test_unknown_backend_name():
     with pytest.raises(SetupError, match="Unknown backend"):
-        backends.make_backend("gemini")
+        backends.make_backend("mistral")
 
 
 # --- real subprocesses with a stand-in CLI -----------------------------------------------------------
@@ -384,23 +385,27 @@ def test_openai_summary_calls_return_markdown():
 
 
 def test_each_openai_compatible_provider_has_its_own_endpoint_key_and_default_model(monkeypatch):
-    for name in ("OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_BASE_URL"):
+    for name in ("OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "OPENAI_BASE_URL"):
         monkeypatch.setenv(name, f"test-{name}") if name != "OPENAI_BASE_URL" else monkeypatch.delenv(name, raising=False)
 
     openai_client = OpenAIBackend()._client()
     xai_client = XAIBackend()._client()
     router_client = OpenRouterBackend()._client()
+    gemini_client = GeminiBackend()._client()
     custom_client = OpenAIBackend(base_url="https://compatible.example.test/v1")._client()
 
     assert str(openai_client.base_url).startswith("https://api.openai.com/v1")
     assert str(xai_client.base_url).startswith("https://api.x.ai/v1")
     assert str(router_client.base_url).startswith("https://openrouter.ai/api/v1")
+    assert str(gemini_client.base_url) == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert gemini_client.api_key == "test-GEMINI_API_KEY" and gemini_client.max_retries == 0
     assert str(custom_client.base_url).startswith("https://compatible.example.test/v1")
     assert openai_client.api_key == "test-OPENAI_API_KEY" and xai_client.api_key == "test-XAI_API_KEY"
     assert router_client.api_key == "test-OPENROUTER_API_KEY"
     assert router_client.max_retries == 0 and xai_client.max_retries == 0  # the reader retries, with backoff
     assert router_client.default_headers["X-OpenRouter-Title"] == "AI reads books page by page"
     assert (XAIBackend().model, OpenRouterBackend().model) == (backends.XAI_MODEL, backends.OPENROUTER_PAGE_MODEL)
+    assert (GeminiBackend().model, GeminiBackend.summary_model) == ("gemini-3.8-flash", "gemini-4-argon")
 
 
 def test_xai_uses_the_openai_shape_with_reasoning_effort():
@@ -457,6 +462,40 @@ def test_api_errors_are_classified(backend_class, kind, message, code, expected)
         assert type(caught.value) is BackendError  # not retried, not a setup problem
 
 
+# Gemini's own wording, as its OpenAI-compatible endpoint sent it on 2026-10-29 where marked "live".
+@pytest.mark.parametrize("kind, message, code, expected", [
+    ("BadRequestError", "Please pass a valid API key", 400, SetupError),  # live: a wrong key is a 400
+    ("PermissionDeniedError", "Your API key was reported as leaked. Please use another API key.", 403, SetupError),
+    ("APIStatusError", "Your prepayment credits are depleted. Please go to AI Studio at "
+                       "https://ai.studio/projects to manage your project and billing.", 402, UsageLimitError),  # live
+    ("RateLimitError", "You exceeded your current quota, please check your plan and billing details. "
+                       "quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier. Please retry in 35.5s.",
+     429, TransientError),
+    ("RateLimitError", "You exceeded your current quota, please check your plan and billing details. "
+                       "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier", 429, UsageLimitError),
+    ("NotFoundError", "models/gemini-9-nope is not found for API version v1main, or is not supported for "
+                      "generateContent.", 404, SetupError),  # live
+    ("BadRequestError", "Invalid reasoning_effort: xhigh. Valid values are: high, low, medium, minimal, none",
+     400, BackendError),  # live
+    ("InternalServerError", "The model is overloaded. Please try again later.", 503, TransientError),
+])
+def test_gemini_errors_are_classified(kind, message, code, expected):
+    with pytest.raises(expected) as caught:
+        GeminiBackend(client=FakeOpenAI(error=openai_error(kind, message, code))).ask("SYSTEM", "prompt")
+
+    if expected is BackendError:
+        assert type(caught.value) is BackendError
+        assert "Valid values are" in str(caught.value)
+
+
+def test_an_answer_held_back_by_a_content_filter_is_retried():
+    held = _Obj(choices=[_Obj(message=_Obj(content="", refusal=None), finish_reason="content_filter")],
+                model_extra={})
+
+    with pytest.raises(TransientError, match="recitation"):
+        GeminiBackend(client=FakeOpenAI(response=held)).ask("SYSTEM", "prompt", PAGE_SCHEMA)
+
+
 def test_openrouter_explains_a_model_that_cannot_return_a_schema():
     error = openai_error("InternalServerError",
                          "There is no available model provider that meets your routing requirements", 503)
@@ -467,6 +506,7 @@ def test_openrouter_explains_a_model_that_cannot_return_a_schema():
 
 @pytest.mark.parametrize("backend_class, key", [
     (OpenAIBackend, "OPENAI_API_KEY"), (XAIBackend, "XAI_API_KEY"), (OpenRouterBackend, "OPENROUTER_API_KEY"),
+    (GeminiBackend, "GEMINI_API_KEY"),
 ])
 def test_a_missing_api_key_explains_the_plan_backends(backend_class, key, monkeypatch):
     monkeypatch.delenv(key, raising=False)
@@ -625,7 +665,7 @@ def openai_wire(monkeypatch):
     real = openai.OpenAI
     monkeypatch.setattr(openai, "OpenAI", lambda **kw: real(
         **kw, http_client=httpx.Client(transport=httpx.MockTransport(wire.handler(httpx)))))
-    for name in ("OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY"):
+    for name in ("OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.setenv(name, f"test-{name}")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     return wire
@@ -664,6 +704,31 @@ def test_xai_and_openai_on_the_wire(openai_wire):
     assert url == "https://api.openai.com/v1/chat/completions"
     assert headers["authorization"] == "Bearer test-OPENAI_API_KEY"
     assert body["model"] == backends.OPENAI_PAGE_MODEL and "x-openrouter-title" not in headers
+
+
+def test_gemini_on_the_wire(openai_wire):
+    reply = GeminiBackend(effort="low").ask("SYSTEM", PAGE_TEXT, PAGE_SCHEMA)
+
+    url, headers, body = openai_wire.sent()
+    assert url == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    assert headers["authorization"] == "Bearer test-GEMINI_API_KEY"
+    assert (body["model"], body["reasoning_effort"]) == ("gemini-3.8-flash", "low")
+    assert body["response_format"]["json_schema"] == {"name": "page_notes", "strict": True, "schema": PAGE_SCHEMA}
+    assert "tools" not in body and reply.value == {"has_content": True}
+
+
+def test_gemini_error_bodies_from_the_wire(openai_wire):
+    # Gemini wraps its errors in a list; these two bodies are what it sent live.
+    openai_wire.status = 400
+    openai_wire.body = [{"error": {"code": 400, "message": "Please pass a valid API key", "status": "INVALID_ARGUMENT"}}]
+    with pytest.raises(SetupError, match="GEMINI_API_KEY"):
+        GeminiBackend().ask("SYSTEM", "prompt", PAGE_SCHEMA)
+
+    openai_wire.status = 402
+    openai_wire.body = [{"error": {"code": 402, "message": "Your prepayment credits are depleted.",
+                                   "status": "RESOURCE_EXHAUSTED"}}]
+    with pytest.raises(UsageLimitError, match="prepayment credits"):
+        GeminiBackend().ask("SYSTEM", "prompt", PAGE_SCHEMA)
 
 
 def test_a_402_from_the_wire_stops_the_reader(openai_wire):
@@ -742,3 +807,4 @@ def test_a_rejected_key_is_never_echoed_back():
     assert "jCcA" not in str(caught.value) and "sk-proj" not in str(caught.value)
     assert "[key hidden]" in str(caught.value) and "platform.openai.com/account/api-keys" in str(caught.value)
     assert backends._redact("xai-AbCdEf123456 and sk-ant-api03-abcDEF_123") == "[key hidden] and [key hidden]"
+    assert backends._redact("key=AIzaFakeFakeFakeFakeFake_0123-456789") == "key=[key hidden]"

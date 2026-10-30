@@ -13,6 +13,7 @@ On every page it writes down what it learned, each note tagged with its page num
 | A Grok plan | `--backend grok` ([Grok Build](https://docs.x.ai/build/overview)) | `grok login` |
 | An OpenAI API key | `--backend openai` (the default) | `export OPENAI_API_KEY=...` |
 | An Anthropic API key | `--backend anthropic` | `export ANTHROPIC_API_KEY=...` |
+| A Gemini API key | `--backend gemini` | `export GEMINI_API_KEY=...` |
 | An xAI API key | `--backend xai` | `export XAI_API_KEY=...` |
 | An OpenRouter key | `--backend openrouter` | `export OPENROUTER_API_KEY=...` |
 
@@ -36,6 +37,7 @@ python read_books.py --backend claude --start-page 31 --test-pages 3     # Claud
 python read_books.py --backend grok --start-page 31 --test-pages 3       # Grok plan
 python read_books.py --start-page 31 --test-pages 3                      # OpenAI API key
 python read_books.py --backend anthropic --start-page 31 --test-pages 3  # Anthropic API key
+python read_books.py --backend gemini --start-page 31 --test-pages 3     # Gemini API key
 python read_books.py --backend xai --start-page 31 --test-pages 3        # xAI API key
 python read_books.py --backend openrouter --start-page 31 --test-pages 3 # OpenRouter key
 ```
@@ -53,7 +55,7 @@ Stop it any time with Ctrl+C. Every finished page is saved, and running the same
 Being straight with you about what was run for real:
 
 - **Run on real pages** (3 pages of `meditations.pdf`, with a look back and a final summary): the **Claude Code**, **Codex** and **Grok Build** CLIs.
-- **Checked against each provider's official docs, but not yet run live**: the **OpenAI**, **Anthropic**, **xAI** and **OpenRouter** APIs. Each one has offline tests that run the real SDK and check the exact request the provider would receive and how its answers and errors are handled. The doc pages each backend follows are linked in [`backends.py`](backends.py).
+- **Checked against each provider's official docs, but not yet run live**: the **OpenAI**, **Anthropic**, **Gemini**, **xAI** and **OpenRouter** APIs. Each one has offline tests that run the real SDK and check the exact request the provider would receive and how its answers and errors are handled. The doc pages each backend follows are linked in [`backends.py`](backends.py). For Gemini, its real answers to a wrong key, an unknown model and an account with no credit were checked live; no page has been read with it yet.
 
 If you run one of the untested ones, an issue saying how it went would help everyone.
 
@@ -129,7 +131,7 @@ Run `python read_books.py --help` for all of them. The ones you will use most:
 | Option | What it does |
 |---|---|
 | `pdf` | The book to read (default: `meditations.pdf`) |
-| `--backend NAME` | Who reads it: `openai` (default), `anthropic`, `xai`, `openrouter`, `claude`, `codex` or `grok` |
+| `--backend NAME` | Who reads it: `openai` (default), `anthropic`, `gemini`, `xai`, `openrouter`, `claude`, `codex` or `grok` |
 | `--model NAME` | The model for pages and summaries (defaults below) |
 | `--summary-backend`, `--summary-model` | Let a different backend or model write the summaries |
 | `--effort LEVEL` | Reasoning effort, for models that have it (for example `low`, `medium`, `high`) |
@@ -148,11 +150,12 @@ The default models:
 |---|---|---|
 | `openai` | `gpt-6-luna` | `gpt-6.1-sol` |
 | `anthropic` | `claude-opus-5-5` | `claude-opus-5-5` |
+| `gemini` | `gemini-3.8-flash` | `gemini-4-argon` |
 | `xai` | `grok-4.7` | `grok-4.7` |
 | `openrouter` | `openai/gpt-6-luna` | `openai/gpt-6.1-sol` |
 | `claude`, `codex`, `grok` | the CLI's own default | the same |
 
-`--model` sets both; add `--summary-model` to give the summaries their own. On Anthropic, `--model claude-haiku-5-5` reads for a fraction of the price of Opus. On OpenRouter, pick a model that can return structured outputs ([this list](https://openrouter.ai/models?supported_parameters=structured_outputs)); the reader only sends pages to providers that honour the format, and tells you if your model has none.
+`--model` sets both; add `--summary-model` to give the summaries their own. On Anthropic, `--model claude-haiku-5-5` reads for a fraction of the price of Opus. On Gemini, `--effort` takes `minimal`, `low`, `medium` or `high`. On OpenRouter, pick a model that can return structured outputs ([this list](https://openrouter.ai/models?supported_parameters=structured_outputs)); the reader only sends pages to providers that honour the format, and tells you if your model has none.
 
 You can mix backends. For example, read with Grok but let Claude write the summaries:
 
@@ -181,7 +184,7 @@ Codex and Claude runs are not saved anywhere. Grok Build has no such option yet,
 - **A CLI is slower than an API.** Every page starts a fresh CLI run, and that startup time comes on top of the model's own thinking. In our 3 page test with each CLI's default model, a page took about 10 seconds on Claude Code, about 13 seconds on Codex and about 19 seconds on Grok. So a 250 page book is roughly an hour or more of reading, plus the summaries. You can leave it running, and Ctrl+C never loses a finished page.
 - **An API key is billed per use.** A book is one call per page plus a few summaries, so a 250 page book is a few hundred calls. Try `--test-pages 3` first to see what a page costs you.
 - **Limits can stop a long book.** When your plan hits its usage limit or your API account runs out of credit, the reader stops, keeps every page so far, and tells you. Run the same command later and it carries on.
-- **Your book's text goes to the provider you choose** (OpenAI, Anthropic, xAI, or OpenRouter and the provider it routes to), under your account's terms. Only send books you are happy to share with them.
+- **Your book's text goes to the provider you choose** (OpenAI, Anthropic, Google, xAI, or OpenRouter and the provider it routes to), under your account's terms. Only send books you are happy to share with them.
 - **Summaries are AI writing.** They can miss or bend things. Every note keeps its page number, so you can check it against the book.
 - **PDF text is not always clean.** Multi-column or heavily designed pages can come out in the wrong order, and scanned pages need `--ocr auto`.
 

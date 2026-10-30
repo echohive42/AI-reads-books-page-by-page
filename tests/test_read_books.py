@@ -534,7 +534,7 @@ def test_cli_parses_backends_models_resume_reset_and_limits():
     assert (args.context_window, args.summary_chunk_size, args.ocr, args.timeout) == (3, 5, "auto", 30)
     assert args.summary_max_item_chars == 2000 and args.reset is True
     with pytest.raises(SystemExit):
-        parser.parse_args(["--backend", "gemini"])
+        parser.parse_args(["--backend", "mistral"])
 
 
 def test_summary_model_defaults_follow_the_backend():
